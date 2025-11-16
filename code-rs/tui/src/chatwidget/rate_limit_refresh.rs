@@ -102,6 +102,7 @@ fn run_refresh(
             msg: EventMsg::TokenCount(TokenCountEvent {
                 info: None,
                 rate_limits: Some(snapshot),
+                account_id: None,
             }),
             order: None,
         };

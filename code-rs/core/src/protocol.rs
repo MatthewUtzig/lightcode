@@ -501,7 +501,11 @@ pub fn event_msg_to_protocol(msg: &EventMsg) -> Option<code_protocol::protocol::
                 .as_ref()
                 .map(rate_limit_snapshot_to_protocol);
             Some(code_protocol::protocol::EventMsg::TokenCount(
-                code_protocol::protocol::TokenCountEvent { info, rate_limits },
+                code_protocol::protocol::TokenCountEvent {
+                    info,
+                    rate_limits,
+                    account_id: payload.account_id.clone(),
+                },
             ))
         }
         _ => convert_value(msg),
@@ -517,7 +521,11 @@ pub fn event_msg_from_protocol(msg: &code_protocol::protocol::EventMsg) -> Optio
                 .rate_limits
                 .as_ref()
                 .map(rate_limit_snapshot_from_protocol);
-            Some(EventMsg::TokenCount(TokenCountEvent { info, rate_limits }))
+            Some(EventMsg::TokenCount(TokenCountEvent {
+                info,
+                rate_limits,
+                account_id: payload.account_id.clone(),
+            }))
         }
         _ => {
             let converted = convert_value(msg)?;
@@ -608,6 +616,7 @@ fn rate_limit_snapshot_to_protocol(
     code_protocol::protocol::RateLimitSnapshot {
         primary: Some(primary),
         secondary: Some(secondary),
+        account_id: snapshot.account_id.clone(),
     }
 }
 
@@ -661,6 +670,7 @@ fn rate_limit_snapshot_from_protocol(
         secondary_window_minutes,
         primary_reset_after_seconds,
         secondary_reset_after_seconds,
+        account_id: snapshot.account_id.clone(),
     }
 }
 
@@ -936,12 +946,16 @@ pub struct RateLimitSnapshotEvent {
     /// Seconds until the secondary window resets, if reported by the API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_reset_after_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct TokenCountEvent {
     pub info: Option<TokenUsageInfo>,
     pub rate_limits: Option<RateLimitSnapshotEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

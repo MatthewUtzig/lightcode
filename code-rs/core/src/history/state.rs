@@ -945,6 +945,10 @@ pub struct RateLimitsRecord {
     pub id: HistoryId,
     pub snapshot: RateLimitSnapshotEvent,
     pub legend: Vec<RateLimitLegendEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2966,12 +2970,15 @@ mod tests {
                 secondary_window_minutes: 5,
                 primary_reset_after_seconds: Some(30),
                 secondary_reset_after_seconds: Some(60),
+                account_id: None,
             },
             legend: vec![RateLimitLegendEntry {
                 label: "primary".into(),
                 description: "desc".into(),
                 tone: TextTone::Info,
             }],
+            account_id: None,
+            account_label: None,
         }));
 
         let mut patch_changes = HashMap::new();

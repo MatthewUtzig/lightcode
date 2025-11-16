@@ -1,15 +1,20 @@
 use chrono::{DateTime, Utc};
 use code_app_server_protocol::AuthMode;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use tracing::warn;
 use uuid::Uuid;
 
+use crate::auth;
+use crate::config::resolve_code_path_for_read;
 use crate::token_data::TokenData;
 
 const ACCOUNTS_FILE_NAME: &str = "auth_accounts.json";
+const SLOT_PREFIX: &str = "slot";
+const MAX_SLOT_DEPTH: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredAccount {
@@ -198,7 +203,12 @@ fn upsert_account(mut data: AccountsFile, mut new_account: StoredAccount) -> (Ac
 pub fn list_accounts(code_home: &Path) -> io::Result<Vec<StoredAccount>> {
     let path = accounts_file_path(code_home);
     let data = read_accounts_file(&path)?;
-    Ok(data.accounts)
+    let mut accounts = data.accounts;
+    match discover_slot_accounts(code_home) {
+        Ok(mut slots) => accounts.append(&mut slots),
+        Err(err) => warn!(?err, "failed to load slot-based accounts"),
+    }
+    Ok(accounts)
 }
 
 pub fn get_active_account_id(code_home: &Path) -> io::Result<Option<String>> {
@@ -210,10 +220,21 @@ pub fn get_active_account_id(code_home: &Path) -> io::Result<Option<String>> {
 pub fn find_account(code_home: &Path, account_id: &str) -> io::Result<Option<StoredAccount>> {
     let path = accounts_file_path(code_home);
     let data = read_accounts_file(&path)?;
-    Ok(data
+    if let Some(account) = data
         .accounts
         .into_iter()
-        .find(|acc| acc.id == account_id))
+        .find(|acc| acc.id == account_id)
+    {
+        return Ok(Some(account));
+    }
+
+    match discover_slot_accounts(code_home) {
+        Ok(slots) => Ok(slots.into_iter().find(|acc| acc.id == account_id)),
+        Err(err) => {
+            warn!(?err, "failed to load slot-based accounts");
+            Ok(None)
+        }
+    }
 }
 
 pub fn set_active_account_id(
@@ -300,6 +321,203 @@ pub fn upsert_api_key_account(
     Ok(stored)
 }
 
+fn discover_slot_accounts(code_home: &Path) -> io::Result<Vec<StoredAccount>> {
+    let mut accounts = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for root in slot_roots(code_home) {
+        if let Err(err) = scan_slot_root(&root, &mut seen_ids, &mut accounts) {
+            if err.kind() == ErrorKind::NotFound {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
+    accounts.sort_by(|a, b| slot_display_key(a).cmp(&slot_display_key(b)));
+    Ok(accounts)
+}
+
+fn slot_roots(code_home: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![code_home.to_path_buf()];
+    let read_path = resolve_code_path_for_read(code_home, Path::new("auth.json"));
+    if let Some(parent) = read_path.parent() {
+        if !roots.iter().any(|root| root == parent) {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    roots
+}
+
+fn scan_slot_root(
+    root: &Path,
+    seen_ids: &mut HashSet<String>,
+    out: &mut Vec<StoredAccount>,
+) -> io::Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if !name.to_ascii_lowercase().starts_with(SLOT_PREFIX) {
+            continue;
+        }
+        scan_slot_dir(entry.path(), vec![name], 0, seen_ids, out)?;
+    }
+
+    Ok(())
+}
+
+fn scan_slot_dir(
+    path: PathBuf,
+    components: Vec<String>,
+    depth: usize,
+    seen_ids: &mut HashSet<String>,
+    out: &mut Vec<StoredAccount>,
+) -> io::Result<()> {
+    if depth > MAX_SLOT_DEPTH {
+        return Ok(());
+    }
+
+    let auth_path = path.join("auth.json");
+    if auth_path.is_file() {
+        match auth::try_read_auth_json(&auth_path) {
+            Ok(auth_json) => push_slot_account(auth_json, &components, seen_ids, out),
+            Err(err) => warn!(?auth_path, ?err, "failed to read slot auth file"),
+        }
+        return Ok(());
+    }
+
+    if depth == MAX_SLOT_DEPTH {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let mut next_components = components.clone();
+        next_components.push(name);
+        scan_slot_dir(entry.path(), next_components, depth + 1, seen_ids, out)?;
+    }
+
+    Ok(())
+}
+
+fn push_slot_account(
+    auth_json: auth::AuthDotJson,
+    components: &[String],
+    seen_ids: &mut HashSet<String>,
+    out: &mut Vec<StoredAccount>,
+) {
+    let base_id = make_slot_id_slug(components);
+    let id = ensure_unique_slot_id(&base_id, seen_ids);
+    let label = format!("Slot {}", slot_label(components));
+    let mode = if auth_json.tokens.is_some() {
+        AuthMode::ChatGPT
+    } else {
+        AuthMode::ApiKey
+    };
+
+    out.push(StoredAccount {
+        id,
+        mode,
+        label: Some(label),
+        openai_api_key: auth_json.openai_api_key,
+        tokens: auth_json.tokens,
+        last_refresh: auth_json.last_refresh,
+        created_at: None,
+        last_used_at: None,
+    });
+}
+
+fn slot_display_key(account: &StoredAccount) -> String {
+    account
+        .label
+        .clone()
+        .unwrap_or_else(|| account.id.clone())
+        .to_ascii_lowercase()
+}
+
+fn slot_label(components: &[String]) -> String {
+    if components.is_empty() {
+        return "account".to_string();
+    }
+    components.join(" / ")
+}
+
+fn make_slot_id_slug(components: &[String]) -> String {
+    let parts: Vec<String> = components
+        .iter()
+        .map(|component| sanitize_slot_component(component))
+        .filter(|component| !component.is_empty())
+        .collect();
+    let slug = if parts.is_empty() {
+        "slot".to_string()
+    } else {
+        parts.join("-")
+    };
+    format!("slot-{slug}")
+}
+
+fn sanitize_slot_component(component: &str) -> String {
+    let mut slug = String::new();
+    for ch in component.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn ensure_unique_slot_id(base: &str, seen_ids: &mut HashSet<String>) -> String {
+    if seen_ids.insert(base.to_string()) {
+        return base.to_string();
+    }
+
+    let mut counter = 2usize;
+    loop {
+        let candidate = format!("{base}-{counter}");
+        if seen_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 pub fn upsert_chatgpt_account(
     code_home: &Path,
     tokens: TokenData,
@@ -343,6 +561,7 @@ pub fn upsert_chatgpt_account(
 mod tests {
     use super::*;
     use base64::Engine;
+    use crate::auth::{write_auth_json, AuthDotJson};
     use crate::token_data::{IdTokenInfo, TokenData};
     use tempfile::tempdir;
 
@@ -489,5 +708,60 @@ mod tests {
 
         let active_after = get_active_account_id(home.path()).expect("active id");
         assert!(active_after.is_none());
+    }
+
+    #[test]
+    fn list_accounts_includes_slot_directories() {
+        let home = tempdir().expect("tempdir");
+        let slot_dir = home.path().join("slot-one");
+        std::fs::create_dir_all(&slot_dir).expect("slot dir");
+
+        let tokens = make_chatgpt_tokens(Some("acct-slot"), Some("slot@example.com"));
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(tokens),
+            last_refresh: Some(Utc::now()),
+        };
+        write_auth_json(&slot_dir.join("auth.json"), &auth).expect("write auth");
+
+        let accounts = list_accounts(home.path()).expect("list");
+        let slot_account = accounts
+            .iter()
+            .find(|acc| acc.id.starts_with("slot-"))
+            .expect("missing slot account");
+        assert_eq!(slot_account.mode, AuthMode::ChatGPT);
+        assert_eq!(
+            slot_account
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.account_id.as_deref()),
+            Some("acct-slot"),
+        );
+        assert!(slot_account
+            .label
+            .as_ref()
+            .is_some_and(|label| label.contains("Slot")));
+    }
+
+    #[test]
+    fn nested_slot_directories_are_discovered() {
+        let home = tempdir().expect("tempdir");
+        let nested = home.path().join("slot").join("beta");
+        std::fs::create_dir_all(&nested).expect("nested slot dir");
+
+        let auth = AuthDotJson {
+            openai_api_key: Some("sk-slot".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+        write_auth_json(&nested.join("auth.json"), &auth).expect("write auth");
+
+        let accounts = list_accounts(home.path()).expect("list");
+        let slot_account = accounts
+            .iter()
+            .find(|acc| acc.openai_api_key.is_some())
+            .expect("slot not discovered");
+        assert_eq!(slot_account.mode, AuthMode::ApiKey);
+        assert!(slot_account.id.starts_with("slot-"));
     }
 }

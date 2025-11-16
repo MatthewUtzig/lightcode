@@ -984,6 +984,7 @@ fn parse_rate_limit_snapshot(headers: &HeaderMap) -> Option<RateLimitSnapshotEve
         secondary_window_minutes,
         primary_reset_after_seconds,
         secondary_reset_after_seconds,
+        account_id: None,
     })
 }
 

@@ -1246,6 +1246,7 @@ pub(crate) struct ChatWidget<'a> {
     rate_limit_last_fetch_at: Option<DateTime<Utc>>,
     rate_limit_primary_next_reset_at: Option<DateTime<Utc>>,
     rate_limit_secondary_next_reset_at: Option<DateTime<Utc>>,
+    last_rate_limit_account_id: Option<String>,
     content_buffer: String,
     // Buffer for streaming assistant answer text; we do not surface partial
     // We wait for the final AgentMessage event and then emit the full text
@@ -4953,6 +4954,7 @@ impl ChatWidget<'_> {
             rate_limit_last_fetch_at: None,
             rate_limit_primary_next_reset_at: None,
             rate_limit_secondary_next_reset_at: None,
+            last_rate_limit_account_id: None,
             content_buffer: String::new(),
             last_assistant_message: None,
             exec: ExecState {
@@ -5263,6 +5265,7 @@ impl ChatWidget<'_> {
             rate_limit_last_fetch_at: None,
             rate_limit_primary_next_reset_at: None,
             rate_limit_secondary_next_reset_at: None,
+            last_rate_limit_account_id: None,
             content_buffer: String::new(),
             last_assistant_message: None,
             exec: ExecState {
@@ -6678,9 +6681,14 @@ impl ChatWidget<'_> {
             .map(|account| (account.id.clone(), account))
             .collect();
 
-        let active_id = auth_accounts::get_active_account_id(&code_home)
-            .ok()
-            .flatten();
+        let snapshot_account_id = current_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.account_id.clone());
+        let active_id = self
+            .last_rate_limit_account_id
+            .clone()
+            .or_else(|| snapshot_account_id.clone())
+            .or_else(|| auth_accounts::get_active_account_id(&code_home).ok().flatten());
 
         let usage_records = account_usage::list_rate_limit_snapshots(&code_home).unwrap_or_default();
         let mut snapshot_map: HashMap<String, StoredRateLimitSnapshot> = usage_records
@@ -6722,7 +6730,12 @@ impl ChatWidget<'_> {
                 .map(account_display_label)
                 .or_else(|| active_id.clone())
                 .unwrap_or_else(|| "Current session".to_string());
-            let header = Self::account_header_lines(account_ref, snapshot_ref, summary_ref);
+            let header = Self::account_header_lines(
+                account_ref,
+                snapshot_ref,
+                summary_ref,
+                active_id.as_deref(),
+            );
             let is_api_key_account = matches!(
                 account_ref.map(|acc| acc.mode),
                 Some(McpAuthMode::ApiKey)
@@ -6802,6 +6815,7 @@ impl ChatWidget<'_> {
                             account,
                             Some(&record),
                             usage_summary.as_ref(),
+                            Some(id.as_str()),
                         );
                         let is_api_key_account = matches!(
                             account.map(|acc| acc.mode),
@@ -6828,6 +6842,7 @@ impl ChatWidget<'_> {
                             account,
                             Some(&record),
                             usage_summary.as_ref(),
+                            Some(id.as_str()),
                         );
                         tabs.push(LimitsTab::message(title, header, lines));
                     }
@@ -6848,6 +6863,7 @@ impl ChatWidget<'_> {
                         account,
                         None,
                         usage_summary.as_ref(),
+                        Some(id.as_str()),
                     );
                     tabs.push(LimitsTab::message(title, header, lines));
                 }
@@ -6876,6 +6892,16 @@ impl ChatWidget<'_> {
         let output_cost = (totals.output_tokens as f64 / TOKENS_PER_MILLION)
             * OUTPUT_COST_PER_MILLION_USD;
         input_cost + cached_cost + output_cost
+    }
+
+    fn account_label_for_id(&self, account_id: &str) -> String {
+        if let Ok(Some(account)) = auth_accounts::find_account(&self.config.code_home, account_id) {
+            return account_display_label(&account);
+        }
+        if account_id.starts_with("slot-") {
+            return format!("Slot ({account_id})");
+        }
+        account_id.to_string()
     }
 
     fn format_usd(amount: f64) -> String {
@@ -6917,6 +6943,7 @@ impl ChatWidget<'_> {
         account: Option<&StoredAccount>,
         record: Option<&StoredRateLimitSnapshot>,
         usage: Option<&StoredUsageSummary>,
+        account_id: Option<&str>,
     ) -> Vec<RtLine<'static>> {
         let mut lines: Vec<RtLine<'static>> = Vec::new();
 
@@ -6955,6 +6982,21 @@ impl ChatWidget<'_> {
         };
 
         lines.push(RtLine::from(String::new()));
+
+        if let Some(id) = account_id {
+            let label = account
+                .map(account_display_label)
+                .unwrap_or_else(|| id.to_string());
+            let display = if label.trim() == id {
+                label
+            } else {
+                format!("{label} ({id})")
+            };
+            lines.push(RtLine::from(vec![
+                RtSpan::raw(status_field_prefix("Account")),
+                RtSpan::styled(display, value_style),
+            ]));
+        }
 
         lines.push(RtLine::from(vec![
             RtSpan::raw(status_field_prefix("Type")),
@@ -11453,7 +11495,13 @@ impl ChatWidget<'_> {
                     self.total_token_usage = info.total_token_usage.clone();
                     self.last_token_usage = info.last_token_usage.clone();
                 }
-                if let Some(snapshot) = event.rate_limits {
+                let mut observed_account_id = event.account_id.clone();
+                if let Some(mut snapshot) = event.rate_limits {
+                    if observed_account_id.is_none() {
+                        observed_account_id = snapshot.account_id.clone();
+                    } else if snapshot.account_id.is_none() {
+                        snapshot.account_id = observed_account_id.clone();
+                    }
                     self.update_rate_limit_resets(&snapshot);
                     let warnings = self
                         .rate_limit_warnings
@@ -11477,10 +11525,15 @@ impl ChatWidget<'_> {
                         }
                     }
                     if !legend_entries.is_empty() {
+                        let account_label = observed_account_id
+                            .as_ref()
+                            .map(|id| self.account_label_for_id(id));
                         let record = RateLimitsRecord {
                             id: HistoryId::ZERO,
                             snapshot: snapshot.clone(),
                             legend: legend_entries,
+                            account_id: observed_account_id.clone(),
+                            account_label,
                         };
                         let cell = history_cell::RateLimitsCell::from_record(record.clone());
                         let key = self.next_internal_key();
@@ -11509,6 +11562,9 @@ impl ChatWidget<'_> {
                     if refresh_limits_settings {
                         self.show_limits_settings_ui();
                     }
+                }
+                if let Some(account_id) = observed_account_id {
+                    self.last_rate_limit_account_id = Some(account_id);
                 }
                 self.bottom_pane.set_token_usage(
                     self.total_token_usage.clone(),
@@ -19738,7 +19794,21 @@ Have we met every part of this goal and is there no further work to do?"#
         if let Some(snapshot) = &self.rate_limit_snapshot {
             let primary = snapshot.primary_used_percent.clamp(0.0, 100.0).round() as i64;
             let secondary = snapshot.secondary_used_percent.clamp(0.0, 100.0).round() as i64;
-            Some(format!("Primary: {}% · Secondary: {}%", primary, secondary))
+            let mut summary = format!("Primary: {}% · Secondary: {}%", primary, secondary);
+            if let Some(account_id) = snapshot
+                .account_id
+                .as_deref()
+                .or(self.last_rate_limit_account_id.as_deref())
+            {
+                let label = self.account_label_for_id(account_id);
+                let display = if label.trim() == account_id {
+                    label
+                } else {
+                    format!("{label} ({account_id})")
+                };
+                summary.push_str(&format!(" · Account: {}", display));
+            }
+            Some(summary)
         } else if self.rate_limit_fetch_inflight {
             Some("Refreshing usage...".to_string())
         } else {

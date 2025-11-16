@@ -9,6 +9,7 @@ mod apply_patch;
 pub mod auth;
 pub mod auth_accounts;
 pub mod account_usage;
+pub mod account_scheduler;
 pub mod bash;
 mod chat_completions;
 mod client;

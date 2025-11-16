@@ -69,15 +69,16 @@ use crate::protocol::ApprovedCommandMatchKind;
 use crate::protocol::WebSearchBeginEvent;
 use crate::protocol::WebSearchCompleteEvent;
 use code_protocol::mcp_protocol::AuthMode;
+use crate::account_scheduler::{AccountScheduler, AccountSelection, SchedulerOutcome};
 use crate::account_usage;
+use crate::auth;
 use crate::auth_accounts;
 use crate::agent_defaults::{default_agent_configs, enabled_agent_model_specs};
 use code_protocol::models::WebSearchAction;
 use code_protocol::protocol::RolloutItem;
 use shlex::split as shlex_split;
 use shlex::try_join as shlex_try_join;
-use chrono::Local;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 
 pub mod compact;
 use self::compact::{build_compacted_history, collect_compaction_snippets};
@@ -1329,6 +1330,8 @@ struct BackgroundExecState {
 pub(crate) struct Session {
     id: Uuid,
     client: ModelClient,
+    account_scheduler: Option<Arc<Mutex<AccountScheduler>>>,
+    current_account_id: Mutex<Option<String>>,
     tx_event: Sender<Event>,
 
     /// The session's current working directory. All relative paths provided by
@@ -1424,6 +1427,19 @@ impl ToolCallCtx {
 }
 
 impl Session {
+    pub(crate) fn account_scheduler(&self) -> Option<Arc<Mutex<AccountScheduler>>> {
+        self.account_scheduler.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn set_current_account_id(&self, account_id: Option<String>) {
+        let mut guard = self.current_account_id.lock().unwrap();
+        *guard = account_id;
+    }
+
+    pub(crate) fn current_account_id(&self) -> Option<String> {
+        self.current_account_id.lock().unwrap().clone()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn get_writable_roots(&self) -> &[PathBuf] {
         &self._writable_roots
@@ -4082,6 +4098,7 @@ async fn submission_loop(
     rx_sub: Receiver<Submission>,
     tx_event: Sender<Event>,
 ) {
+    let account_scheduler = Arc::new(Mutex::new(AccountScheduler::new(config.code_home.clone())));
     let mut config = config;
     let mut sess: Option<Arc<Session>> = None;
     let mut agent_manager_initialized = false;
@@ -4500,10 +4517,20 @@ async fn submission_loop(
                 agent_models.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
                 tools_config.set_agent_models(agent_models);
 
+                let current_account_id = match auth_accounts::get_active_account_id(&config.code_home) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        warn!("failed to read active account id: {err:#}");
+                        None
+                    }
+                };
+
                 let model_descriptions = model_guide_markdown_with_custom(&config.agents);
                 let mut new_session = Arc::new(Session {
                     id: session_id,
                     client,
+                    account_scheduler: Some(Arc::clone(&account_scheduler)),
+                    current_account_id: Mutex::new(current_account_id.clone()),
                     tools_config,
                     tx_event: tx_event.clone(),
                     user_instructions: effective_user_instructions.clone(),
@@ -5520,7 +5547,25 @@ async fn run_turn(
     // Attempt input starts as the provided input, and may be augmented with
     // items from a previous dropped stream attempt so we don't lose progress.
     let mut attempt_input: Vec<ResponseItem> = input.clone();
+    let scheduler_handle = sess.account_scheduler();
+    let mut scheduler_active = scheduler_handle.is_some();
+    let mut selected_account: Option<AccountSelection> = None;
+    let mut need_new_account = scheduler_handle.is_some();
     loop {
+        if scheduler_active && (need_new_account || selected_account.is_none()) {
+            if let Some(handle) = scheduler_handle.as_ref() {
+                if let Some(selection) = select_scheduler_account(handle) {
+                    ensure_account_is_active(sess, &selection)?;
+                    selected_account = Some(selection);
+                    need_new_account = false;
+                } else {
+                    scheduler_active = false;
+                    selected_account = None;
+                    need_new_account = false;
+                }
+            }
+        }
+
         // Each loop iteration corresponds to a single provider HTTP request.
         // Increment the attempt ordinal first and capture its value so all
         // OrderMeta emitted during this attempt share the same `req`, even if
@@ -5566,6 +5611,11 @@ async fn run_turn(
                 }
                 // Commit successful attempt – scratchpad is no longer needed.
                 sess.clear_scratchpad();
+                if let (Some(handle), Some(selection)) =
+                    (scheduler_handle.as_ref(), selected_account.as_ref())
+                {
+                    record_scheduler_success(handle, &selection.account_id);
+                }
                 return Ok(output);
             }
             Err(CodexErr::Interrupted) => return Err(CodexErr::Interrupted),
@@ -5592,6 +5642,23 @@ async fn run_turn(
                         });
                     }
                 }
+                let resume_at = match &e {
+                    CodexErr::UsageLimitReached(limit_err) =>
+                        resume_at_from_secs(limit_err.resets_in_seconds),
+                    _ => None,
+                };
+
+                if scheduler_active
+                    && scheduler_should_retry(
+                        &scheduler_handle,
+                        &mut selected_account,
+                        resume_at,
+                    )
+                {
+                    need_new_account = scheduler_handle.is_some();
+                    continue;
+                }
+
                 return Err(e);
             }
             Err(e) => {
@@ -5770,6 +5837,59 @@ async fn run_turn(
             }
         }
     }
+}
+
+fn select_scheduler_account(handle: &Arc<Mutex<AccountScheduler>>) -> Option<AccountSelection> {
+    let mut scheduler = handle.lock().unwrap();
+    scheduler.next_account(Utc::now())
+}
+
+fn ensure_account_is_active(sess: &Session, selection: &AccountSelection) -> CodexResult<()> {
+    let code_home = sess.client.code_home();
+    let active_id = auth_accounts::get_active_account_id(code_home)
+        .ok()
+        .flatten();
+    if active_id.as_deref() == Some(selection.account_id.as_str()) {
+        sess.set_current_account_id(Some(selection.account_id.clone()));
+        return Ok(());
+    }
+
+    auth::activate_account(code_home, &selection.account_id)?;
+    if let Some(manager) = sess.client.get_auth_manager() {
+        manager.reload();
+    }
+    sess.set_current_account_id(Some(selection.account_id.clone()));
+    Ok(())
+}
+
+fn record_scheduler_success(handle: &Arc<Mutex<AccountScheduler>>, account_id: &str) {
+    if let Ok(mut scheduler) = handle.lock() {
+        scheduler.record_outcome(account_id, SchedulerOutcome::Success);
+    }
+}
+
+fn scheduler_should_retry(
+    handle: &Option<Arc<Mutex<AccountScheduler>>>,
+    selected_account: &mut Option<AccountSelection>,
+    resume_at: Option<DateTime<Utc>>,
+) -> bool {
+    if let (Some(handle), Some(selection)) = (handle, selected_account.as_ref()) {
+        if let Ok(mut scheduler) = handle.lock() {
+            scheduler.record_outcome(
+                &selection.account_id,
+                SchedulerOutcome::RateLimited { resume_at },
+            );
+        }
+        *selected_account = None;
+        return true;
+    }
+    false
+}
+
+fn resume_at_from_secs(resets_in_seconds: Option<u64>) -> Option<DateTime<Utc>> {
+    let secs = resets_in_seconds?;
+    let clamped = secs.min(i64::MAX as u64) as i64;
+    Utc::now().checked_add_signed(ChronoDuration::seconds(clamped))
 }
 
 fn reconcile_pending_tool_outputs(
@@ -6052,6 +6172,7 @@ async fn try_run_turn(
                     let payload = TokenCountEvent {
                         info: new_info,
                         rate_limits,
+                        account_id: sess.current_account_id(),
                     };
                     sess.tx_event
                         .send(sess.make_event(&sub_id, EventMsg::TokenCount(payload)))
@@ -6133,9 +6254,10 @@ async fn try_run_turn(
                     sess.tx_event.send(stamped).await.ok();
                 }
             }
-            ResponseEvent::RateLimits(snapshot) => {
-                let mut state = sess.state.lock().unwrap();
-                state.latest_rate_limits = Some(snapshot.clone());
+            ResponseEvent::RateLimits(mut snapshot) => {
+                if snapshot.account_id.is_none() {
+                    snapshot.account_id = sess.current_account_id();
+                }
                 if let Some(ctx) = account_usage_context(sess) {
                     let usage_home = ctx.code_home.clone();
                     let usage_account = ctx.account_id.clone();
@@ -6153,6 +6275,8 @@ async fn try_run_turn(
                         }
                     });
                 }
+                let mut state = sess.state.lock().unwrap();
+                state.latest_rate_limits = Some(snapshot);
             }
             // Note: ReasoningSummaryPartAdded handled above without scratchpad mutation.
         }

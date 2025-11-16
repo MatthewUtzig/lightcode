@@ -837,6 +837,42 @@ mod tests {
     }
 
     #[test]
+    fn slot_style_account_ids_write_usage_and_snapshots() {
+        let home = TempDir::new().expect("tempdir");
+        let account_id = "slot-alpha";
+        let usage = sample_usage();
+        let now = Utc::now();
+
+        record_token_usage(home.path(), account_id, None, &usage, now)
+            .expect("usage recorded");
+
+        let usage_path = home
+            .path()
+            .join("usage")
+            .join(format!("{account_id}.json"));
+        assert!(usage_path.exists(), "usage file should use the account id in its name");
+
+        let snapshot = RateLimitSnapshotEvent {
+            primary_used_percent: 50.0,
+            secondary_used_percent: 25.0,
+            primary_to_secondary_ratio_percent: 50.0,
+            primary_window_minutes: 60,
+            secondary_window_minutes: 10080,
+            primary_reset_after_seconds: Some(1200),
+            secondary_reset_after_seconds: Some(3600),
+            account_id: None,
+        };
+        record_rate_limit_snapshot(home.path(), account_id, None, &snapshot, now)
+            .expect("snapshot recorded");
+
+        let stored = list_rate_limit_snapshots(home.path()).expect("snapshots listed");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].account_id, account_id);
+        assert_eq!(stored[0].primary_next_reset_at.is_some(), true);
+        assert_eq!(stored[0].secondary_next_reset_at.is_some(), true);
+    }
+
+    #[test]
     fn rate_limit_warning_only_logs_once_per_reset() {
         let home = TempDir::new().expect("tempdir");
         let now = Utc::now();

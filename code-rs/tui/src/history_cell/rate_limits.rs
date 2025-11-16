@@ -52,6 +52,10 @@ impl HistoryCell for RateLimitsCell {
             ),
         );
 
+        if let Some(line) = account_line(&self.record) {
+            lines.push(line);
+        }
+
         let snapshot = &self.record.snapshot;
         lines.extend(snapshot_summary_lines(snapshot));
 
@@ -78,6 +82,23 @@ impl HistoryCell for RateLimitsCell {
             .try_into()
             .unwrap_or(0)
     }
+}
+
+fn account_line(record: &RateLimitsRecord) -> Option<Line<'static>> {
+    let account_id = record
+        .account_id
+        .as_deref()
+        .or(record.snapshot.account_id.as_deref())?;
+    let label = record.account_label.as_deref().filter(|label| !label.is_empty());
+    let text = match label {
+        Some(label) if label != account_id => format!("Account: {label} ({account_id})"),
+        Some(label) => format!("Account: {label}"),
+        None => format!("Account: {account_id}"),
+    };
+    Some(Line::from(vec![Span::styled(
+        text,
+        Style::default().fg(crate::colors::text_dim()),
+    )]))
 }
 
 fn snapshot_summary_lines(snapshot: &RateLimitSnapshotEvent) -> Vec<Line<'static>> {
