@@ -2139,6 +2139,53 @@ fn settings_help_overlay_from_section() {
 }
 
 #[test]
+fn model_selection_overlay_lists_auto_drive_target() {
+    let mut harness = ChatWidgetHarness::new();
+
+    harness.suppress_rate_limit_refresh();
+    harness.open_model_selection_overlay();
+    harness.send_key(make_key(KeyCode::Tab, KeyModifiers::NONE));
+
+    let frame = normalize_output(render_chat_widget_to_vt100(&mut harness, 100, 28));
+    assert!(
+        frame.contains("Target: Auto Drive"),
+        "model selection overlay should expose Auto Drive target\n{}",
+        frame
+    );
+    assert!(
+        frame.contains("Auto Drive model"),
+        "model selection overlay should show Auto Drive model label\n{}",
+        frame
+    );
+    assert!(
+        frame.contains("Inherit session model"),
+        "Auto Drive panel should include an explicit inherit row\n{}",
+        frame
+    );
+}
+
+#[test]
+fn settings_overview_reports_auto_drive_model() {
+    let mut harness = ChatWidgetHarness::new();
+
+    harness.suppress_rate_limit_refresh();
+    harness.set_auto_model_override(Some("gpt-5.1-codex-mini"));
+    harness.open_settings_overlay_overview();
+
+    let frame = normalize_output(render_chat_widget_to_vt100(&mut harness, 100, 28));
+    assert!(
+        frame.contains("Auto Drive Model"),
+        "settings overview should include Auto Drive model row\n{}",
+        frame
+    );
+    assert!(
+        frame.contains("gpt-5.1-codex-mini"),
+        "settings overview should report configured Auto Drive slug\n{}",
+        frame
+    );
+}
+
+#[test]
 fn compaction_checkpoint_warning_notice() {
     let _guard = ENV_LOCK.lock().unwrap();
     let mut harness = ChatWidgetHarness::new();

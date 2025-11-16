@@ -892,7 +892,7 @@ use crate::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::bottom_pane::CloudTasksView;
 use crate::bottom_pane::validation_settings_view;
 use crate::bottom_pane::validation_settings_view::{GroupStatus, ToolRow};
-use crate::bottom_pane::model_selection_view::ModelSelectionTarget;
+use crate::bottom_pane::model_selection_view::{ModelSelectionEntry, ModelSelectionTarget};
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::{UndoTimelineEntry, UndoTimelineEntryKind, UndoTimelineView};
@@ -14998,11 +14998,12 @@ fi\n\
             })
         };
 
+        let auto_config = self.config_for_auto_drive();
         match start_auto_coordinator(
             coordinator_events,
             goal.clone(),
             conversation,
-            self.config.clone(),
+            auto_config,
             self.config.debug,
             derive_goal_from_history,
         ) {
@@ -18675,12 +18676,8 @@ Have we met every part of this goal and is there no further work to do?"#
             return;
         }
 
-        self.bottom_pane.show_model_selection(
-            presets,
-            self.config.model.clone(),
-            self.config.model_reasoning_effort,
-            ModelSelectionTarget::Session,
-        );
+        let entries = vec![self.session_model_entry(), self.auto_model_entry()];
+        self.bottom_pane.show_model_selection(presets, entries);
     }
 
     pub(crate) fn show_review_model_selector(&mut self) {
@@ -18692,12 +18689,8 @@ Have we met every part of this goal and is there no further work to do?"#
             );
             return;
         }
-        self.bottom_pane.show_model_selection(
-            presets,
-            self.config.review_model.clone(),
-            self.config.review_model_reasoning_effort,
-            ModelSelectionTarget::Review,
-        );
+        let entries = vec![self.review_model_entry()];
+        self.bottom_pane.show_model_selection(presets, entries);
     }
 
     pub(crate) fn apply_model_selection(&mut self, model: String, effort: Option<ReasoningEffort>) {
@@ -18817,6 +18810,77 @@ Have we met every part of this goal and is there no further work to do?"#
         self.request_redraw();
     }
 
+    pub(crate) fn apply_auto_model_selection(&mut self, model: String) {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let normalized_existing = self
+            .config
+            .auto_model
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase());
+        let normalized_new = if self.config.model.eq_ignore_ascii_case(trimmed) {
+            None
+        } else {
+            Some(trimmed.to_ascii_lowercase())
+        };
+
+        if normalized_existing == normalized_new {
+            self.bottom_pane
+                .flash_footer_notice("Auto Drive model unchanged.".to_string());
+            return;
+        }
+
+        self.config.auto_model = normalized_new
+            .as_ref()
+            .map(|_| trimmed.to_string());
+
+        let persist_message = if let Ok(home) = code_core::config::find_code_home() {
+            match code_core::config::set_auto_model(&home, self.config.auto_model.as_deref()) {
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!("Failed to persist Auto Drive model override: {err}");
+                    Some("Auto Drive model set for this session (failed to persist).".to_string())
+                }
+            }
+        } else {
+            tracing::warn!("Could not locate Code home to persist Auto Drive model override");
+            Some("Auto Drive model set for this session.".to_string())
+        };
+
+        let message = if let Some(custom) = persist_message {
+            custom
+        } else if self.config.auto_model.is_some() {
+            format!("Auto Drive model set to {}", trimmed)
+        } else {
+            "Auto Drive will now match the session model".to_string()
+        };
+
+        self.bottom_pane.flash_footer_notice(message);
+        self.refresh_settings_overview_rows();
+        self.request_redraw();
+    }
+
+    fn config_for_auto_drive(&self) -> code_core::config::Config {
+        let mut config = self.config.clone();
+        if let Some(auto_model) = self
+            .config
+            .auto_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !config.model.eq_ignore_ascii_case(auto_model) {
+                config.model = auto_model.to_string();
+                config.model_family = find_family_for_model(auto_model)
+                    .unwrap_or_else(|| derive_default_model_family(auto_model));
+            }
+        }
+        config
+    }
+
     pub(crate) fn handle_reasoning_command(&mut self, command_args: String) {
         // command_args contains only the arguments after the command (e.g., "high" not "/reasoning high")
         let trimmed = command_args.trim();
@@ -18851,12 +18915,8 @@ Have we met every part of this goal and is there no further work to do?"#
                 return;
             }
 
-        self.bottom_pane.show_model_selection(
-            presets,
-            self.config.model.clone(),
-            self.config.model_reasoning_effort,
-            ModelSelectionTarget::Session,
-        );
+        let entries = vec![self.session_model_entry()];
+        self.bottom_pane.show_model_selection(presets, entries);
             return;
         }
     }
@@ -19207,16 +19267,36 @@ Have we met every part of this goal and is there no further work to do?"#
 
     fn build_model_settings_content(&self) -> ModelSettingsContent {
         let presets = self.available_model_presets();
-        let current_model = self.config.model.clone();
-        let current_effort = self.config.model_reasoning_effort;
-        let view = ModelSelectionView::new(
-            presets,
-            current_model,
-            current_effort,
-            ModelSelectionTarget::Session,
-            self.app_event_tx.clone(),
-        );
+        let entries = vec![self.session_model_entry(), self.auto_model_entry()];
+        let view = ModelSelectionView::new(presets, entries, self.app_event_tx.clone());
         ModelSettingsContent::new(view)
+    }
+
+    fn session_model_entry(&self) -> ModelSelectionEntry {
+        ModelSelectionEntry::new(
+            ModelSelectionTarget::Session,
+            self.config.model.clone(),
+            self.config.model_reasoning_effort,
+            false,
+        )
+    }
+
+    fn auto_model_entry(&self) -> ModelSelectionEntry {
+        ModelSelectionEntry::new(
+            ModelSelectionTarget::Auto,
+            self.config.resolved_auto_model().to_string(),
+            ReasoningEffort::High,
+            self.config.auto_model.is_none(),
+        )
+    }
+
+    fn review_model_entry(&self) -> ModelSelectionEntry {
+        ModelSelectionEntry::new(
+            ModelSelectionTarget::Review,
+            self.config.review_model.clone(),
+            self.config.review_model_reasoning_effort,
+            false,
+        )
     }
 
     fn build_theme_settings_content(&mut self) -> ThemeSettingsContent {
@@ -19553,6 +19633,12 @@ Have we met every part of this goal and is there no further work to do?"#
         {
             parts.push(format!("Profile: {}", profile));
         }
+        let auto_label = if self.config.auto_model.is_some() {
+            self.config.resolved_auto_model().to_string()
+        } else {
+            "Same as session".to_string()
+        };
+        parts.push(format!("Auto: {}", auto_label));
         Some(parts.join(" · "))
     }
 
@@ -24608,6 +24694,30 @@ mod tests {
         assert!(ChatWidget::multiline_slash_command_requires_split("/auto"));
         assert!(!ChatWidget::multiline_slash_command_requires_split("/plan"));
         assert!(!ChatWidget::multiline_slash_command_requires_split("/solve add context"));
+    }
+
+    #[test]
+    fn config_for_auto_drive_uses_override_and_falls_back() {
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+
+        chat.config.model = "gpt-5.1-codex".to_string();
+        chat.config.model_family = find_family_for_model(&chat.config.model)
+            .unwrap_or_else(|| derive_default_model_family(&chat.config.model));
+        chat.config.auto_model = Some("gpt-5.1-codex-mini".to_string());
+
+        let override_config = chat.config_for_auto_drive();
+        assert_eq!(override_config.model, "gpt-5.1-codex-mini");
+        assert_eq!(
+            override_config.model_family,
+            find_family_for_model("gpt-5.1-codex-mini")
+                .unwrap_or_else(|| derive_default_model_family("gpt-5.1-codex-mini"))
+        );
+
+        chat.config.auto_model = None;
+        let fallback_config = chat.config_for_auto_drive();
+        assert_eq!(fallback_config.model, "gpt-5.1-codex");
+        assert_eq!(fallback_config.model_family, chat.config.model_family);
     }
     use ratatui::backend::TestBackend;
     use ratatui::text::Line;

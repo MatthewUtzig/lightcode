@@ -5,7 +5,7 @@
 
 ## [Unreleased]
 
-- (none)
+- Core/TUI: add an `auto_model` override so `/auto` runs can use a dedicated model from `/settings`.
 
 ## [0.4.16] - 2025-11-15
 

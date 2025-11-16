@@ -901,6 +901,7 @@ fn run_auto_loop(
     derive_goal_from_history: bool,
 ) -> Result<()> {
     let mut config = config;
+    let preferred_model_slug = config.model.clone();
     config.model_reasoning_effort = ReasoningEffort::High;
     config.model_text_verbosity = TextVerbosity::Low;
     let compact_prompt_text =
@@ -1013,7 +1014,7 @@ fn run_auto_loop(
     let mut requests_completed: u64 = 0;
     let mut consecutive_decision_failures: u32 = 0;
     let mut session_metrics = SessionMetrics::default();
-    let mut active_model_slug = MODEL_SLUG.to_string();
+    let mut active_model_slug = preferred_model_slug.clone();
     let mut prev_compact_summary: Option<String> = None;
 
     loop {
@@ -1068,6 +1069,7 @@ fn run_auto_loop(
                 auto_instructions.as_deref(),
                 &event_tx,
                 &cancel_token,
+                &preferred_model_slug,
             ) {
                 Ok(ParsedCoordinatorDecision {
                     status,
@@ -1249,6 +1251,7 @@ fn run_auto_loop(
                     auto_instructions.as_deref(),
                     &event_tx,
                     &cancel_token,
+                    &preferred_model_slug,
                 ) {
                     Ok((user_response, cli_command)) => {
                         if let Some(response_text) = user_response.clone() {
@@ -1616,6 +1619,7 @@ fn request_coordinator_decision(
     auto_instructions: Option<&str>,
     event_tx: &AutoCoordinatorEventSender,
     cancel_token: &CancellationToken,
+    preferred_model_slug: &str,
 ) -> Result<ParsedCoordinatorDecision, DecisionFailure> {
     let RequestStreamResult {
         output_text,
@@ -1633,6 +1637,7 @@ fn request_coordinator_decision(
         auto_instructions,
         event_tx,
         cancel_token,
+        preferred_model_slug,
     )
     .map_err(|err| DecisionFailure::new(err, "coordinator_decision", None))?;
     if output_text.trim().is_empty() && response_items.is_empty() {
@@ -1662,6 +1667,7 @@ fn request_decision(
     auto_instructions: Option<&str>,
     event_tx: &AutoCoordinatorEventSender,
     cancel_token: &CancellationToken,
+    preferred_model_slug: &str,
 ) -> Result<RequestStreamResult> {
     match request_decision_with_model(
         runtime,
@@ -1674,14 +1680,14 @@ fn request_decision(
         auto_instructions,
         event_tx,
         cancel_token,
-        MODEL_SLUG,
+        preferred_model_slug,
     ) {
         Ok(result) => Ok(result),
         Err(err) => {
             let fallback_slug = client.default_model_slug().to_string();
-            if fallback_slug != MODEL_SLUG && should_retry_with_default_model(&err) {
+            if fallback_slug != preferred_model_slug && should_retry_with_default_model(&err) {
                 debug!(
-                    preferred = %MODEL_SLUG,
+                    preferred = %preferred_model_slug,
                     fallback = %fallback_slug,
                     "auto coordinator falling back to configured model after invalid model error"
                 );
@@ -1741,6 +1747,7 @@ fn request_user_turn_decision(
     auto_instructions: Option<&str>,
     event_tx: &AutoCoordinatorEventSender,
     cancel_token: &CancellationToken,
+    preferred_model_slug: &str,
 ) -> Result<(Option<String>, Option<String>), DecisionFailure> {
     let result = request_decision(
         runtime,
@@ -1753,6 +1760,7 @@ fn request_user_turn_decision(
         auto_instructions,
         event_tx,
         cancel_token,
+        preferred_model_slug,
     )
     .map_err(|err| DecisionFailure::new(err, "auto_coordinator_user_turn", None))?;
     let (user_response, cli_command) = parse_user_turn_reply(&result.output_text)

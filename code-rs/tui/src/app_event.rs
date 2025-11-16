@@ -214,6 +214,11 @@ pub(crate) enum AppEvent {
         effort: ReasoningEffort,
     },
 
+    /// Update the Auto Drive model override
+    UpdateAutoModelSelection {
+        model: String,
+    },
+
     /// Update the text verbosity level
     UpdateTextVerbosity(TextVerbosity),
 

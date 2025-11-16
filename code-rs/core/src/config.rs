@@ -108,6 +108,9 @@ pub struct Config {
     /// Model used specifically for review sessions. Defaults to "gpt-5.1-codex-mini".
     pub review_model: String,
 
+    /// Optional override for Auto Drive runs. Falls back to `model` when unset.
+    pub auto_model: Option<String>,
+
     /// Reasoning effort used when running review sessions.
     pub review_model_reasoning_effort: ReasoningEffort,
 
@@ -1009,6 +1012,42 @@ pub fn set_review_model(
     Ok(())
 }
 
+/// Persist the Auto Drive model override into `CODEX_HOME/config.toml`.
+pub fn set_auto_model(code_home: &Path, model: Option<&str>) -> anyhow::Result<()> {
+    let config_path = code_home.join(CONFIG_TOML_FILE);
+    let read_path = resolve_code_path_for_read(code_home, Path::new(CONFIG_TOML_FILE));
+    let mut doc = match std::fs::read_to_string(&read_path) {
+        Ok(contents) => contents.parse::<DocumentMut>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    match model.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }) {
+        Some(value) => {
+            doc["auto_model"] = toml_edit::value(value);
+        }
+        None => {
+            if doc.as_table_mut().remove("auto_model").is_none() {
+                // Nothing to remove; still continue to persist to keep file consistent.
+            }
+        }
+    }
+
+    std::fs::create_dir_all(code_home)?;
+    let tmp_file = NamedTempFile::new_in(code_home)?;
+    std::fs::write(tmp_file.path(), doc.to_string())?;
+    tmp_file.persist(config_path)?;
+
+    Ok(())
+}
+
 /// Persist Auto Drive defaults under `[auto_drive]`.
 pub fn set_auto_drive_settings(
     code_home: &Path,
@@ -1657,6 +1696,8 @@ pub struct ConfigToml {
     pub model: Option<String>,
     /// Review model override used by the `/review` feature.
     pub review_model: Option<String>,
+    /// Auto Drive model override used by the `/auto` feature.
+    pub auto_model: Option<String>,
     /// Reasoning effort override used for the review model.
     pub review_model_reasoning_effort: Option<ReasoningEffort>,
 
@@ -1976,10 +2017,12 @@ fn upgrade_legacy_model_slugs(cfg: &mut ConfigToml) {
 
     maybe_upgrade(&mut cfg.model);
     maybe_upgrade(&mut cfg.review_model);
+    maybe_upgrade(&mut cfg.auto_model);
 
     for profile in cfg.profiles.values_mut() {
         maybe_upgrade(&mut profile.model);
         maybe_upgrade(&mut profile.review_model);
+        maybe_upgrade(&mut profile.auto_model);
     }
 }
 
@@ -2012,6 +2055,7 @@ fn upgrade_legacy_model_slug(slug: &str) -> Option<String> {
 pub struct ConfigOverrides {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub auto_model: Option<String>,
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<AskForApproval>,
     pub sandbox_mode: Option<SandboxMode>,
@@ -2033,6 +2077,17 @@ pub struct ConfigOverrides {
 }
 
 impl Config {
+    /// Active model slug for Auto Drive (override or session default).
+    pub fn resolved_auto_model(&self) -> &str {
+        if let Some(value) = self.auto_model.as_deref() {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        self.model.as_str()
+    }
+
     /// Meant to be used exclusively for tests: `load_with_overrides()` should
     /// be used in all other cases.
     pub fn load_from_base_config_with_overrides(
@@ -2049,6 +2104,7 @@ impl Config {
         let ConfigOverrides {
             model,
             review_model: override_review_model,
+            auto_model: override_auto_model,
             cwd,
             approval_policy,
             sandbox_mode,
@@ -2367,9 +2423,16 @@ impl Config {
             .or(cfg.review_model_reasoning_effort)
             .unwrap_or(ReasoningEffort::High);
 
+        let auto_model = override_auto_model
+            .or(config_profile.auto_model.clone())
+            .or(cfg.auto_model)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
         let config = Self {
             model,
             review_model,
+            auto_model,
             review_model_reasoning_effort,
             model_family,
             model_context_window,
@@ -2847,6 +2910,47 @@ persistence = "none"
         let tui = parsed.tui.expect("config should include tui section");
 
         assert_eq!(tui.notifications, Notifications::Enabled(false));
+    }
+
+    #[test]
+    fn set_auto_model_writes_and_clears_override() -> anyhow::Result<()> {
+        let code_home = TempDir::new()?;
+
+        set_auto_model(code_home.path(), Some("gpt-5.1-codex-mini"))?;
+        let contents = std::fs::read_to_string(code_home.path().join(CONFIG_TOML_FILE))?;
+        assert!(contents.contains("auto_model = \"gpt-5.1-codex-mini\""));
+
+        set_auto_model(code_home.path(), None)?;
+        let cleared = std::fs::read_to_string(code_home.path().join(CONFIG_TOML_FILE))?;
+        assert!(!cleared.contains("auto_model"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_auto_model_prefers_override() -> anyhow::Result<()> {
+        let code_home = TempDir::new()?;
+        let cfg = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                model: Some("gpt-5.1-codex".to_string()),
+                auto_model: Some("gpt-5.1".to_string()),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            code_home.path().to_path_buf(),
+        )?;
+        assert_eq!(cfg.resolved_auto_model(), "gpt-5.1");
+
+        let cfg_inherit = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                model: Some("gpt-5.1-codex-mini".to_string()),
+                auto_model: None,
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            code_home.path().to_path_buf(),
+        )?;
+        assert_eq!(cfg_inherit.resolved_auto_model(), "gpt-5.1-codex-mini");
+        Ok(())
     }
 
     #[test]

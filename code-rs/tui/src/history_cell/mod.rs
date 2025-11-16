@@ -5356,6 +5356,14 @@ pub(crate) fn new_status_output(
         provider_disp.into(),
     ]));
 
+    let auto_model = lookup("auto model");
+    if !auto_model.is_empty() {
+        lines.push(Line::from(vec![
+            "  • Auto Drive Model: ".into(),
+            auto_model.into(),
+        ]));
+    }
+
     // Only show Reasoning fields if present in config summary
     let reff = lookup("reasoning effort");
     if !reff.is_empty() {

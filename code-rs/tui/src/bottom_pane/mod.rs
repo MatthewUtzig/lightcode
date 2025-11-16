@@ -92,10 +92,9 @@ use approval_modal_view::ApprovalModalView;
 #[cfg(feature = "code-fork")]
 use approval_ui::ApprovalUi;
 use code_common::model_presets::ModelPreset;
-use code_core::config_types::ReasoningEffort;
 use code_core::config_types::TextVerbosity;
 use code_core::config_types::ThemeName;
-pub(crate) use model_selection_view::{ModelSelectionTarget, ModelSelectionView};
+pub(crate) use model_selection_view::{ModelSelectionEntry, ModelSelectionView};
 pub(crate) use mcp_settings_view::McpSettingsView;
 pub(crate) use theme_selection_view::ThemeSelectionView;
 use verbosity_selection_view::VerbositySelectionView;
@@ -676,17 +675,9 @@ impl BottomPane<'_> {
     pub fn show_model_selection(
         &mut self,
         presets: Vec<ModelPreset>,
-        current_model: String,
-        current_effort: ReasoningEffort,
-        target: ModelSelectionTarget,
+        entries: Vec<ModelSelectionEntry>,
     ) {
-        let view = ModelSelectionView::new(
-            presets,
-            current_model,
-            current_effort,
-            target,
-            self.app_event_tx.clone(),
-        );
+        let view = ModelSelectionView::new(presets, entries, self.app_event_tx.clone());
         self.active_view = Some(Box::new(view));
         self.active_view_kind = ActiveViewKind::Other;
         // Status shown in composer title now

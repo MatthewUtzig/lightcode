@@ -20,6 +20,21 @@ The model that Codex should use.
 model = "o3"  # overrides the default of "gpt-5.1"
 ```
 
+## auto_model
+
+Auto Drive sessions can run on a lighter (or simply different) model than the
+main chat. Set `auto_model` to a slug from the presets shown in `/settings →
+Model` when you want `/auto` to use its own budget:
+
+```toml
+model = "gpt-5.1-codex"          # main chat
+auto_model = "gpt-5.1-codex-mini"  # Auto Drive override
+```
+
+When `auto_model` is omitted or matches `model`, Auto Drive inherits the
+session model automatically. You can also set or clear the override from the
+TUI via `/settings → Model` or `/model`.
+
 ## model_providers
 
 This option lets you override and amend the default set of model providers bundled with Codex. This value is a map where the key is the value to use with `model_provider` to select the corresponding provider.

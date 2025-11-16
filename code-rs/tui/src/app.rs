@@ -2282,6 +2282,11 @@ impl App<'_> {
                         widget.apply_review_model_selection(model, effort);
                     }
                 }
+                AppEvent::UpdateAutoModelSelection { model } => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.apply_auto_model_selection(model);
+                    }
+                }
                 AppEvent::UpdateTextVerbosity(new_verbosity) => {
                     if let AppState::Chat { widget } = &mut self.app_state {
                         widget.set_text_verbosity(new_verbosity);

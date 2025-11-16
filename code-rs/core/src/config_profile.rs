@@ -12,6 +12,7 @@ use crate::protocol::AskForApproval;
 pub struct ConfigProfile {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub auto_model: Option<String>,
     /// The key in the `model_providers` map identifying the
     /// [`ModelProviderInfo`] to use.
     pub model_provider: Option<String>,

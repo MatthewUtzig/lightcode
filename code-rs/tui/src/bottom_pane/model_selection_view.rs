@@ -14,19 +14,53 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use super::settings_panel::{render_panel, PanelFrameStyle};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ModelSelectionTarget {
     Session,
+    Auto,
     Review,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelSelectionEntry {
+    pub target: ModelSelectionTarget,
+    pub model: String,
+    pub effort: ReasoningEffort,
+    pub inherits_from_session: bool,
+}
+
+impl ModelSelectionEntry {
+    pub fn new(
+        target: ModelSelectionTarget,
+        model: String,
+        effort: ReasoningEffort,
+        inherits_from_session: bool,
+    ) -> Self {
+        Self {
+            target,
+            model,
+            effort,
+            inherits_from_session,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TargetContext {
+    model: String,
+    effort: ReasoningEffort,
+    inherits_from_session: bool,
 }
 
 impl ModelSelectionTarget {
     fn panel_title(self) -> &'static str {
         match self {
             ModelSelectionTarget::Session => "Select Model & Reasoning",
+            ModelSelectionTarget::Auto => "Select Auto Drive Model",
             ModelSelectionTarget::Review => "Select Review Model & Reasoning",
         }
     }
@@ -34,6 +68,7 @@ impl ModelSelectionTarget {
     fn current_label(self) -> &'static str {
         match self {
             ModelSelectionTarget::Session => "Current model",
+            ModelSelectionTarget::Auto => "Auto Drive model",
             ModelSelectionTarget::Review => "Review model",
         }
     }
@@ -41,7 +76,16 @@ impl ModelSelectionTarget {
     fn reasoning_label(self) -> &'static str {
         match self {
             ModelSelectionTarget::Session => "Reasoning effort",
+            ModelSelectionTarget::Auto => "Auto Drive reasoning",
             ModelSelectionTarget::Review => "Review reasoning",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            ModelSelectionTarget::Session => "Session",
+            ModelSelectionTarget::Auto => "Auto Drive",
+            ModelSelectionTarget::Review => "Review",
         }
     }
 }
@@ -54,25 +98,53 @@ pub(crate) struct ModelSelectionView {
     app_event_tx: AppEventSender,
     is_complete: bool,
     target: ModelSelectionTarget,
+    available_targets: Vec<ModelSelectionTarget>,
+    target_state: HashMap<ModelSelectionTarget, TargetContext>,
+    auto_inherit_selected: bool,
 }
 
 impl ModelSelectionView {
     pub fn new(
         presets: Vec<ModelPreset>,
-        current_model: String,
-        current_effort: ReasoningEffort,
-        target: ModelSelectionTarget,
+        entries: Vec<ModelSelectionEntry>,
         app_event_tx: AppEventSender,
     ) -> Self {
-        let initial_index = Self::initial_selection(&presets, &current_model, current_effort);
+        assert!(!entries.is_empty(), "model selection requires at least one target");
+
+        let mut target_state: HashMap<ModelSelectionTarget, TargetContext> = HashMap::new();
+        let mut available_targets = Vec::with_capacity(entries.len());
+        for entry in entries {
+            available_targets.push(entry.target);
+            target_state.insert(
+                entry.target,
+                TargetContext {
+                    model: entry.model,
+                    effort: entry.effort,
+                    inherits_from_session: entry.inherits_from_session,
+                },
+            );
+        }
+
+        let initial_target = available_targets[0];
+        let initial_context = target_state
+            .get(&initial_target)
+            .expect("model selection target context");
+        let inherits_flag = initial_context.inherits_from_session;
+        let initial_model = initial_context.model.clone();
+        let initial_effort = initial_context.effort;
+        let initial_index = Self::initial_selection(&presets, &initial_model, initial_effort);
         Self {
             presets,
             selected_index: initial_index,
-            current_model,
-            current_effort,
+            current_model: initial_model,
+            current_effort: initial_effort,
             app_event_tx,
             is_complete: false,
-            target,
+            target: initial_target,
+            available_targets,
+            target_state,
+            auto_inherit_selected: matches!(initial_target, ModelSelectionTarget::Auto)
+                && inherits_flag,
         }
     }
 
@@ -98,6 +170,40 @@ impl ModelSelectionView {
         }
 
         0
+    }
+
+    fn apply_target(&mut self, target: ModelSelectionTarget) {
+        if let Some(ctx) = self.target_state.get(&target) {
+            self.target = target;
+            self.current_model = ctx.model.clone();
+            self.current_effort = ctx.effort;
+            self.selected_index =
+                Self::initial_selection(&self.presets, &self.current_model, self.current_effort);
+            self.auto_inherit_selected = matches!(target, ModelSelectionTarget::Auto)
+                && ctx.inherits_from_session;
+        }
+    }
+
+    fn cycle_target(&mut self, forward: bool) {
+        if self.available_targets.len() <= 1 {
+            return;
+        }
+        let mut idx = self
+            .available_targets
+            .iter()
+            .position(|candidate| candidate == &self.target)
+            .unwrap_or(0);
+        if forward {
+            idx = (idx + 1) % self.available_targets.len();
+        } else if idx == 0 {
+            idx = self.available_targets.len() - 1;
+        } else {
+            idx -= 1;
+        }
+        let next_target = self.available_targets[idx];
+        if next_target != self.target {
+            self.apply_target(next_target);
+        }
     }
 
     fn preset_effort(preset: &ModelPreset) -> ReasoningEffort {
@@ -146,6 +252,24 @@ impl ModelSelectionView {
             return;
         }
 
+        if matches!(self.target, ModelSelectionTarget::Auto) {
+            if self.auto_inherit_selected {
+                self.auto_inherit_selected = false;
+                self.selected_index = *sorted.last().unwrap_or(&0);
+                return;
+            }
+            let current_pos = sorted
+                .iter()
+                .position(|&idx| idx == self.selected_index)
+                .unwrap_or(0);
+            if current_pos == 0 {
+                self.auto_inherit_selected = true;
+                return;
+            }
+            self.selected_index = sorted[current_pos - 1];
+            return;
+        }
+
         let current_pos = sorted
             .iter()
             .position(|&idx| idx == self.selected_index)
@@ -167,6 +291,24 @@ impl ModelSelectionView {
             return;
         }
 
+        if matches!(self.target, ModelSelectionTarget::Auto) {
+            if self.auto_inherit_selected {
+                self.auto_inherit_selected = false;
+                self.selected_index = sorted[0];
+                return;
+            }
+            let current_pos = sorted
+                .iter()
+                .position(|&idx| idx == self.selected_index)
+                .unwrap_or(0);
+            if current_pos + 1 >= sorted.len() {
+                self.auto_inherit_selected = true;
+                return;
+            }
+            self.selected_index = sorted[current_pos + 1];
+            return;
+        }
+
         let current_pos = sorted
             .iter()
             .position(|&idx| idx == self.selected_index)
@@ -176,6 +318,15 @@ impl ModelSelectionView {
     }
 
     fn confirm_selection(&mut self) {
+        if matches!(self.target, ModelSelectionTarget::Auto) && self.auto_inherit_selected {
+            if let Some(session_ctx) = self.target_state.get(&ModelSelectionTarget::Session) {
+                let _ = self.app_event_tx.send(AppEvent::UpdateAutoModelSelection {
+                    model: session_ctx.model.clone(),
+                });
+            }
+            self.is_complete = true;
+            return;
+        }
         if let Some(preset) = self.presets.get(self.selected_index) {
             let effort = Self::preset_effort(preset);
             match self.target {
@@ -184,6 +335,11 @@ impl ModelSelectionView {
                         model: preset.model.to_string(),
                         effort: Some(effort),
                     });
+                }
+                ModelSelectionTarget::Auto => {
+                    let _ = self
+                        .app_event_tx
+                        .send(AppEvent::UpdateAutoModelSelection { model: preset.model.to_string() });
                 }
                 ModelSelectionTarget::Review => {
                     let _ = self.app_event_tx.send(AppEvent::UpdateReviewModelSelection {
@@ -197,8 +353,23 @@ impl ModelSelectionView {
     }
 
     fn content_line_count(&self) -> u16 {
-        // Current model, reasoning effort, and initial spacer.
-        let mut lines: u16 = 3;
+        // Current model + reasoning effort + optional target/note rows.
+        let mut lines: u16 = 2;
+        if self.available_targets.len() > 1 {
+            lines = lines.saturating_add(1);
+        }
+        if matches!(self.target, ModelSelectionTarget::Auto) {
+            lines = lines.saturating_add(1);
+        }
+        if self.auto_override_differs() {
+            lines = lines.saturating_add(1);
+        }
+        // Spacer before preset list.
+        lines = lines.saturating_add(1);
+
+        if matches!(self.target, ModelSelectionTarget::Auto) {
+            lines = lines.saturating_add(1);
+        }
 
         let mut previous_model: Option<&str> = None;
         for idx in self.sorted_indices() {
@@ -352,6 +523,15 @@ impl ModelSelectionView {
                 self.is_complete = true;
                 true
             }
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers,
+                ..
+            } => {
+                let forward = !modifiers.contains(KeyModifiers::SHIFT);
+                self.cycle_target(forward);
+                true
+            }
             _ => false,
         }
     }
@@ -362,6 +542,31 @@ impl ModelSelectionView {
         }
 
         let mut lines: Vec<Line> = Vec::new();
+        if self.available_targets.len() > 1 {
+            let mut spans = vec![
+                Span::styled(
+                    "Target: ",
+                    Style::default().fg(crate::colors::text_dim()),
+                ),
+                Span::styled(
+                    self.target.short_label(),
+                    Style::default()
+                        .fg(crate::colors::primary())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "Tab",
+                Style::default().fg(crate::colors::primary()),
+            ));
+            spans.push(Span::styled(
+                " switch target",
+                Style::default().fg(crate::colors::text_dim()),
+            ));
+            lines.push(Line::from(spans));
+        }
+
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{}: ", self.target.current_label()),
@@ -374,6 +579,16 @@ impl ModelSelectionView {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+        if self.auto_override_differs() {
+            if let Some(auto_ctx) = self.target_state.get(&ModelSelectionTarget::Auto) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("Auto Drive: {}", auto_ctx.model),
+                    Style::default()
+                        .fg(crate::colors::text_dim())
+                        .add_modifier(Modifier::ITALIC),
+                )]));
+            }
+        }
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{}: ", self.target.reasoning_label()),
@@ -386,7 +601,29 @@ impl ModelSelectionView {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+
+        if matches!(self.target, ModelSelectionTarget::Auto) {
+            let inherits_session = self
+                .target_state
+                .get(&self.target)
+                .map(|ctx| ctx.inherits_from_session)
+                .unwrap_or(false);
+            let note = if inherits_session {
+                "Auto Drive inherits the session model until you pick an override below."
+            } else {
+                "Select the session model again to make Auto Drive follow it automatically."
+            };
+            lines.push(Line::from(vec![Span::styled(
+                note,
+                Style::default().fg(crate::colors::text_dim()),
+            )]));
+        }
+
         lines.push(Line::from(""));
+
+        if matches!(self.target, ModelSelectionTarget::Auto) {
+            lines.push(self.render_auto_inherit_row());
+        }
 
         let mut previous_model: Option<&str> = None;
         let sorted_indices = self.sorted_indices();
@@ -467,14 +704,28 @@ impl ModelSelectionView {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
+        let mut footer = vec![
             Span::styled("↑↓", Style::default().fg(crate::colors::light_blue())),
             Span::raw(" Navigate  "),
             Span::styled("Enter", Style::default().fg(crate::colors::success())),
             Span::raw(" Select  "),
             Span::styled("Esc", Style::default().fg(crate::colors::error())),
             Span::raw(" Cancel"),
-        ]));
+        ];
+        if self.available_targets.len() > 1 {
+            footer.push(Span::raw("  "));
+            footer.push(Span::styled(
+                "Tab",
+                Style::default().fg(crate::colors::primary()),
+            ));
+            footer.push(Span::raw(" Switch  "));
+            footer.push(Span::styled(
+                "Shift+Tab",
+                Style::default().fg(crate::colors::primary()),
+            ));
+            footer.push(Span::raw(" Back"));
+        }
+        lines.push(Line::from(footer));
 
         let padded = Rect {
             x: area.x.saturating_add(1),
@@ -516,12 +767,54 @@ impl<'a> BottomPaneView<'a> for ModelSelectionView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        let mut title = self.target.panel_title().to_string();
+        if self.available_targets.len() > 1 {
+            title.push_str(" — ");
+            title.push_str(self.target.short_label());
+        }
         render_panel(
             area,
             buf,
-            self.target.panel_title(),
+            &title,
             PanelFrameStyle::bottom_pane(),
             |inner, buf| self.render_panel_body(inner, buf),
         );
+    }
+}
+
+impl ModelSelectionView {
+    fn auto_override_differs(&self) -> bool {
+        let auto_ctx = match self.target_state.get(&ModelSelectionTarget::Auto) {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+        let session_ctx = match self.target_state.get(&ModelSelectionTarget::Session) {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+        !auto_ctx
+            .model
+            .eq_ignore_ascii_case(&session_ctx.model)
+    }
+
+    fn render_auto_inherit_row(&self) -> Line<'static> {
+        let mut label_style = Style::default().fg(crate::colors::text());
+        let mut description_style = Style::default().fg(crate::colors::dim());
+        if self.auto_inherit_selected {
+            let highlight = Style::default()
+                .bg(crate::colors::selection())
+                .add_modifier(Modifier::BOLD);
+            label_style = label_style.patch(highlight);
+            description_style = description_style.patch(highlight);
+        }
+        Line::from(vec![
+            Span::styled("   ", label_style),
+            Span::styled("Inherit session model", label_style),
+            Span::styled(" - ", description_style),
+            Span::styled(
+                "Auto Drive will follow the session model",
+                description_style,
+            ),
+        ])
     }
 }

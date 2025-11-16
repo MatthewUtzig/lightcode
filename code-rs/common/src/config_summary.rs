@@ -8,6 +8,14 @@ pub fn create_config_summary_entries(config: &Config) -> Vec<(&'static str, Stri
     let mut entries = vec![
         ("workdir", config.cwd.display().to_string()),
         ("model", config.model.clone()),
+        (
+            "auto model",
+            if config.auto_model.is_some() {
+                config.resolved_auto_model().to_string()
+            } else {
+                format!("Same as session ({})", config.model)
+            },
+        ),
         ("provider", config.model_provider_id.clone()),
         ("approval", config.approval_policy.to_string()),
         ("sandbox", summarize_sandbox_policy(&config.sandbox_policy)),

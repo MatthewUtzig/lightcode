@@ -160,6 +160,7 @@ pub async fn run_main(cli: Cli, code_linux_sandbox_exe: Option<PathBuf>) -> anyh
     let overrides = ConfigOverrides {
         model,
         review_model: None,
+        auto_model: None,
         config_profile,
         // This CLI is intended to be headless and has no affordances for asking
         // the user for approval.

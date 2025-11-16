@@ -305,6 +305,16 @@ impl ChatWidgetHarness {
         self.flush_into_widget();
     }
 
+    pub fn open_model_selection_overlay(&mut self) {
+        self.chat.handle_model_command(String::new());
+        self.flush_into_widget();
+    }
+
+    pub fn set_auto_model_override(&mut self, slug: Option<&str>) {
+        self.chat.config.auto_model = slug.map(|value| value.to_string());
+        self.chat.refresh_settings_overview_rows();
+    }
+
     pub fn suppress_rate_limit_refresh(&mut self) {
         self.chat.rate_limit_last_fetch_at = Some(Utc::now());
         self.chat.rate_limit_fetch_inflight = false;

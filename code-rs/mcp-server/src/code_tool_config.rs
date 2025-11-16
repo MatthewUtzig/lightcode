@@ -254,6 +254,7 @@ impl CodexToolCallParam {
         let overrides = code_core::config::ConfigOverrides {
             model,
             review_model: None,
+            auto_model: None,
             config_profile: profile,
             cwd: cwd.map(PathBuf::from),
             approval_policy: approval_policy.map(Into::into),
