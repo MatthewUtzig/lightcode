@@ -33,7 +33,7 @@ use code_common::model_presets::builtin_model_presets;
 use code_core::ConversationManager;
 use code_core::agent_defaults::{agent_model_spec, enabled_agent_model_specs};
 use code_core::smoke_test_agent_blocking;
-use code_core::config::Config;
+use code_core::config::{clamp_reasoning_effort_for_model, Config};
 use code_core::git_info::CommitLogEntry;
 use code_core::config_types::AgentConfig;
 use code_core::config_types::AutoDriveContinueMode;
@@ -18933,6 +18933,10 @@ Have we met every part of this goal and is there no further work to do?"#
                 config.model_family = find_family_for_model(auto_model)
                     .unwrap_or_else(|| derive_default_model_family(auto_model));
             }
+            config.model_reasoning_effort = clamp_reasoning_effort_for_model(
+                &config.model,
+                config.model_reasoning_effort,
+            );
         }
         config
     }
@@ -24788,6 +24792,34 @@ mod tests {
         let fallback_config = chat.config_for_auto_drive();
         assert_eq!(fallback_config.model, "gpt-5.1-codex");
         assert_eq!(fallback_config.model_family, chat.config.model_family);
+    }
+
+    #[test]
+    fn config_for_auto_drive_clamps_reasoning_for_codex() {
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        chat.config.model = "gpt-5.1".to_string();
+        chat.config.model_family = find_family_for_model("gpt-5.1")
+            .unwrap_or_else(|| derive_default_model_family("gpt-5.1"));
+        chat.config.model_reasoning_effort = ReasoningEffort::Low;
+        chat.config.auto_model = Some("gpt-5.1-codex".to_string());
+
+        let auto_config = chat.config_for_auto_drive();
+        assert_eq!(auto_config.model, "gpt-5.1-codex");
+        assert_eq!(auto_config.model_reasoning_effort, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn config_for_auto_drive_keeps_reasoning_without_override() {
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        chat.config.model = "gpt-5.1".to_string();
+        chat.config.model_reasoning_effort = ReasoningEffort::Low;
+        chat.config.auto_model = None;
+
+        let config = chat.config_for_auto_drive();
+        assert_eq!(config.model, "gpt-5.1");
+        assert_eq!(config.model_reasoning_effort, ReasoningEffort::Low);
     }
     use ratatui::backend::TestBackend;
     use ratatui::text::Line;

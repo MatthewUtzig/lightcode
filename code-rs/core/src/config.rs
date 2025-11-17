@@ -2652,6 +2652,41 @@ impl Config {
     }
 }
 
+/// Clamp a requested reasoning effort so it matches what the target model supports.
+///
+/// Today the Codex family rejects `minimal`/`low` efforts, so we promote them to
+/// the shallowest accepted tier (medium). GPT-5.1 Codex Mini also only allows
+/// medium/high, so we do the same there. All other models currently accept the
+/// full range, so they pass through untouched.
+pub fn clamp_reasoning_effort_for_model(
+    model: &str,
+    requested: ReasoningEffort,
+) -> ReasoningEffort {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.starts_with("gpt-5.1-codex-mini") {
+        return match requested {
+            ReasoningEffort::High => ReasoningEffort::High,
+            _ => ReasoningEffort::Medium,
+        };
+    }
+
+    // Most codex-prefixed slugs (including legacy "codex-" and the GPT-5 Codex
+    // snapshots) only accept medium/high reasoning. Promote anything below that
+    // to medium so we never send an unsupported value.
+    let is_codex = normalized.starts_with("gpt-5.1-codex")
+        || normalized.starts_with("gpt-5-codex")
+        || normalized.starts_with("codex-");
+    if is_codex {
+        return match requested {
+            ReasoningEffort::High => ReasoningEffort::High,
+            ReasoningEffort::Medium => ReasoningEffort::Medium,
+            _ => ReasoningEffort::Medium,
+        };
+    }
+
+    requested
+}
+
 fn default_review_model() -> String {
     OPENAI_DEFAULT_REVIEW_MODEL.to_string()
 }
@@ -3783,6 +3818,50 @@ model_verbosity = "high"
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn clamp_reasoning_promotes_codex_low_to_medium() {
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1-codex", ReasoningEffort::Low),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("codex-mini-latest", ReasoningEffort::Minimal),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1-codex", ReasoningEffort::High),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn clamp_reasoning_limits_codex_mini_variants() {
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1-codex-mini", ReasoningEffort::Minimal),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1-codex-mini", ReasoningEffort::Low),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1-codex-mini", ReasoningEffort::High),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn clamp_reasoning_passthrough_for_other_models() {
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1", ReasoningEffort::Minimal),
+            ReasoningEffort::Minimal
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("gpt-5.1", ReasoningEffort::Low),
+            ReasoningEffort::Low
+        );
     }
 
     // No test enforcing the presence of a standalone [projects] header.
