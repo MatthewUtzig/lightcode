@@ -388,6 +388,13 @@ pub(crate) enum AppEvent {
     /// Background rate limit refresh failed (threaded request).
     RateLimitFetchFailed { message: String },
 
+    /// Request a background computation of global token usage across accounts.
+    RequestGlobalUsageSummary,
+    /// Global usage computation finished successfully.
+    GlobalUsageSummaryReady { summary: String },
+    /// Global usage computation failed.
+    GlobalUsageSummaryFailed { message: String },
+
     #[allow(dead_code)]
     StartCommitAnimation,
     #[allow(dead_code)]

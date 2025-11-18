@@ -13,6 +13,9 @@ use crate::protocol::TokenUsage;
 
 const USAGE_VERSION: u32 = 1;
 const USAGE_SUBDIR: &str = "usage";
+const AGGREGATE_FILE_NAME: &str = "__aggregate__.json";
+
+pub const AGGREGATE_ACCOUNT_ID: &str = "__aggregate__";
 const HOURLY_HISTORY_DAYS: i64 = 183; // retain ~6 months of hourly usage for history views
 const UNKNOWN_RESET_RELOG_INTERVAL: Duration = Duration::hours(24);
 const RESET_PASSED_TOLERANCE: Duration = Duration::seconds(5);
@@ -297,7 +300,7 @@ fn truncate_to_month(ts: DateTime<Utc>) -> DateTime<Utc> {
     Utc.from_utc_datetime(&month_start)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRateLimitSnapshot {
     pub account_id: String,
     pub plan: Option<String>,
@@ -326,14 +329,35 @@ pub struct StoredUsageSummary {
     pub plan: Option<String>,
     pub totals: TokenTotals,
     pub last_updated: DateTime<Utc>,
+    pub tokens_last_hour: TokenTotals,
     pub hourly_entries: Vec<StoredUsageEntry>,
     pub hourly_buckets: Vec<StoredUsageBucket>,
     pub daily_buckets: Vec<StoredUsageBucket>,
     pub monthly_buckets: Vec<StoredUsageBucket>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalAccountUsageSummary {
+    pub account_id: String,
+    pub plan: Option<String>,
+    pub totals: TokenTotals,
+    pub last_updated: DateTime<Utc>,
+    pub tokens_last_hour: TokenTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalUsageSummary {
+    pub totals: TokenTotals,
+    pub accounts: Vec<GlobalAccountUsageSummary>,
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
 fn usage_dir(code_home: &Path) -> PathBuf {
     code_home.join(USAGE_SUBDIR)
+}
+
+fn aggregate_snapshot_path(code_home: &Path) -> PathBuf {
+    usage_dir(code_home).join(AGGREGATE_FILE_NAME)
 }
 
 fn warning_log_path(code_home: &Path) -> PathBuf {
@@ -342,6 +366,20 @@ fn warning_log_path(code_home: &Path) -> PathBuf {
 
 fn usage_file_path(code_home: &Path, account_id: &str) -> PathBuf {
     usage_dir(code_home).join(format!("{account_id}.json"))
+}
+
+pub fn load_aggregate_rate_limit_snapshot(
+    code_home: &Path,
+) -> std::io::Result<Option<StoredRateLimitSnapshot>> {
+    let path = aggregate_snapshot_path(code_home);
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            let snapshot: StoredRateLimitSnapshot = serde_json::from_str(&contents)?;
+            Ok(Some(snapshot))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn with_usage_file<F>(
@@ -409,6 +447,144 @@ where
     Ok(())
 }
 
+fn write_aggregate_snapshot(
+    code_home: &Path,
+    snapshot: &StoredRateLimitSnapshot,
+) -> std::io::Result<()> {
+    let path = aggregate_snapshot_path(code_home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_vec_pretty(snapshot)?;
+    fs::write(path, payload)
+}
+
+fn recompute_aggregate_rate_limit_snapshot(code_home: &Path) -> std::io::Result<()> {
+    let records = list_rate_limit_snapshots(code_home)?;
+    if let Some(aggregate) = build_aggregate_snapshot(&records) {
+        write_aggregate_snapshot(code_home, &aggregate)?;
+    } else {
+        let path = aggregate_snapshot_path(code_home);
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn build_aggregate_snapshot(
+    records: &[StoredRateLimitSnapshot],
+) -> Option<StoredRateLimitSnapshot> {
+    use std::cmp::{max, min};
+
+    let mut primary_used: Option<f64> = None;
+    let mut secondary_used: Option<f64> = None;
+    let mut primary_window: Option<u64> = None;
+    let mut secondary_window: Option<u64> = None;
+    let mut primary_reset_at: Option<DateTime<Utc>> = None;
+    let mut secondary_reset_at: Option<DateTime<Utc>> = None;
+    let mut observed_at: Option<DateTime<Utc>> = None;
+    let mut last_limit_hit: Option<DateTime<Utc>> = None;
+    let mut any_snapshot = false;
+
+    let now = Utc::now();
+
+    for record in records {
+        let Some(snapshot) = record.snapshot.as_ref() else {
+            continue;
+        };
+        any_snapshot = true;
+
+        primary_used = Some(match primary_used {
+            Some(current) => current.max(snapshot.primary_used_percent),
+            None => snapshot.primary_used_percent,
+        });
+        secondary_used = Some(match secondary_used {
+            Some(current) => current.max(snapshot.secondary_used_percent),
+            None => snapshot.secondary_used_percent,
+        });
+        primary_window = Some(match primary_window {
+            Some(current) => max(current, snapshot.primary_window_minutes),
+            None => snapshot.primary_window_minutes,
+        });
+        secondary_window = Some(match secondary_window {
+            Some(current) => max(current, snapshot.secondary_window_minutes),
+            None => snapshot.secondary_window_minutes,
+        });
+
+        if let Some(next_reset) = record.primary_next_reset_at {
+            primary_reset_at = Some(match primary_reset_at {
+                Some(current) => min(current, next_reset),
+                None => next_reset,
+            });
+        }
+        if let Some(next_reset) = record.secondary_next_reset_at {
+            secondary_reset_at = Some(match secondary_reset_at {
+                Some(current) => min(current, next_reset),
+                None => next_reset,
+            });
+        }
+
+        if let Some(obs) = record.observed_at {
+            observed_at = Some(match observed_at {
+                Some(current) => max(current, obs),
+                None => obs,
+            });
+        }
+        if let Some(hit) = record.last_usage_limit_hit_at {
+            last_limit_hit = Some(match last_limit_hit {
+                Some(current) => max(current, hit),
+                None => hit,
+            });
+        }
+    }
+
+    if !any_snapshot {
+        return None;
+    }
+
+    let mut aggregate_event = RateLimitSnapshotEvent {
+        primary_used_percent: primary_used.unwrap_or(0.0),
+        secondary_used_percent: secondary_used.unwrap_or(0.0),
+        primary_to_secondary_ratio_percent: 0.0,
+        primary_window_minutes: primary_window.unwrap_or(0),
+        secondary_window_minutes: secondary_window.unwrap_or(0),
+        primary_reset_after_seconds: None,
+        secondary_reset_after_seconds: None,
+        account_id: Some(AGGREGATE_ACCOUNT_ID.to_string()),
+    };
+
+    if aggregate_event.primary_window_minutes > 0 && aggregate_event.secondary_window_minutes > 0 {
+        let ratio = aggregate_event.primary_window_minutes as f64
+            / aggregate_event.secondary_window_minutes as f64
+            * 100.0;
+        aggregate_event.primary_to_secondary_ratio_percent = ratio.clamp(0.0, 100.0);
+    }
+
+    aggregate_event.primary_reset_after_seconds = primary_reset_at.map(|ts| {
+        if ts <= now {
+            0
+        } else {
+            (ts - now).num_seconds().max(0) as u64
+        }
+    });
+    aggregate_event.secondary_reset_after_seconds = secondary_reset_at.map(|ts| {
+        if ts <= now {
+            0
+        } else {
+            (ts - now).num_seconds().max(0) as u64
+        }
+    });
+
+    Some(StoredRateLimitSnapshot {
+        account_id: AGGREGATE_ACCOUNT_ID.to_string(),
+        plan: Some("Aggregate".to_string()),
+        snapshot: Some(aggregate_event),
+        observed_at,
+        primary_next_reset_at: primary_reset_at,
+        secondary_next_reset_at: secondary_reset_at,
+        last_usage_limit_hit_at: last_limit_hit,
+    })
+}
+
 pub fn record_token_usage(
     code_home: &Path,
     account_id: &str,
@@ -446,7 +622,10 @@ pub fn record_rate_limit_snapshot(
             .secondary_reset_after_seconds
             .map(|seconds| observed_at + Duration::seconds(seconds as i64));
         data.rate_limit = Some(info);
-    })
+    })?;
+
+    let _ = recompute_aggregate_rate_limit_snapshot(code_home);
+    Ok(())
 }
 
 pub fn list_rate_limit_snapshots(
@@ -467,6 +646,13 @@ pub fn list_rate_limit_snapshots(
             Err(_) => continue,
         };
         let path = entry.path();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq(AGGREGATE_FILE_NAME)
+        {
+            continue;
+        }
         if entry
             .file_type()
             .ok()
@@ -735,11 +921,97 @@ pub fn load_account_usage(
         plan: data.plan,
         totals: data.totals,
         last_updated: data.last_updated,
+        tokens_last_hour: data.tokens_last_hour,
         hourly_entries,
         hourly_buckets,
         daily_buckets,
         monthly_buckets,
     }))
+}
+
+/// Compute a global usage rollup by scanning stored per-account usage summaries.
+///
+/// This function performs blocking filesystem I/O and should be called from a
+/// background thread (e.g., `spawn_blocking` or a lightweight thread) to avoid
+/// stalling the UI thread.
+pub fn collect_global_usage_summary(code_home: &Path) -> std::io::Result<GlobalUsageSummary> {
+    let mut totals = TokenTotals::default();
+    let mut accounts: Vec<GlobalAccountUsageSummary> = Vec::new();
+    let mut last_updated: Option<DateTime<Utc>> = None;
+
+    let usage_dir = usage_dir(code_home);
+    let entries = match fs::read_dir(&usage_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(GlobalUsageSummary::default()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if file_name == AGGREGATE_FILE_NAME || file_name.ends_with(".tmp") {
+            continue;
+        }
+
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+
+        if stem.is_empty() {
+            continue;
+        }
+
+        let summary = match load_account_usage(code_home, stem)? {
+            Some(summary) => summary,
+            None => continue,
+        };
+
+        totals.add_totals(&summary.totals);
+
+        if let Some(current) = last_updated {
+            if summary.last_updated > current {
+                last_updated = Some(summary.last_updated);
+            }
+        } else {
+            last_updated = Some(summary.last_updated);
+        }
+
+        accounts.push(GlobalAccountUsageSummary {
+            account_id: summary.account_id,
+            plan: summary.plan,
+            totals: summary.totals,
+            last_updated: summary.last_updated,
+            tokens_last_hour: summary.tokens_last_hour,
+        });
+    }
+
+    accounts.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+
+    Ok(GlobalUsageSummary {
+        totals,
+        accounts,
+        last_updated,
+    })
+}
+
+/// Spawn a blocking task to compute the global usage summary.
+pub async fn fetch_global_usage_summary(
+    code_home: PathBuf,
+) -> std::io::Result<GlobalUsageSummary> {
+    tokio::task::spawn_blocking(move || collect_global_usage_summary(&code_home))
+        .await
+        .unwrap_or_else(|err| Err(std::io::Error::new(ErrorKind::Other, err.to_string())))
 }
 
 #[cfg(test)]
@@ -1097,6 +1369,45 @@ mod tests {
         )
         .expect("third record succeeds");
         assert!(third, "restored reset metadata after fallback window should re-log");
+    }
+
+    #[test]
+    fn aggregate_snapshot_reflects_worst_usage() {
+        let home = TempDir::new().expect("tempdir");
+        let now = Utc::now();
+        let snapshot_one = RateLimitSnapshotEvent {
+            primary_used_percent: 40.0,
+            secondary_used_percent: 30.0,
+            primary_to_secondary_ratio_percent: 50.0,
+            primary_window_minutes: 60,
+            secondary_window_minutes: 10_080,
+            primary_reset_after_seconds: Some(900),
+            secondary_reset_after_seconds: Some(3_600),
+            account_id: Some("acct-1".to_string()),
+        };
+        let snapshot_two = RateLimitSnapshotEvent {
+            primary_used_percent: 70.0,
+            secondary_used_percent: 55.0,
+            primary_to_secondary_ratio_percent: 50.0,
+            primary_window_minutes: 60,
+            secondary_window_minutes: 10_080,
+            primary_reset_after_seconds: Some(600),
+            secondary_reset_after_seconds: Some(1_800),
+            account_id: Some("acct-2".to_string()),
+        };
+
+        record_rate_limit_snapshot(home.path(), "acct-1", None, &snapshot_one, now)
+            .expect("snapshot one");
+        record_rate_limit_snapshot(home.path(), "acct-2", None, &snapshot_two, now)
+            .expect("snapshot two");
+
+        let aggregate = load_aggregate_rate_limit_snapshot(home.path())
+            .expect("load aggregate")
+            .expect("aggregate snapshot present");
+        assert_eq!(aggregate.account_id, AGGREGATE_ACCOUNT_ID);
+        let agg_snapshot = aggregate.snapshot.expect("aggregate event");
+        assert!(agg_snapshot.primary_used_percent >= snapshot_two.primary_used_percent);
+        assert!(agg_snapshot.secondary_used_percent >= snapshot_two.secondary_used_percent);
     }
 
     #[test]

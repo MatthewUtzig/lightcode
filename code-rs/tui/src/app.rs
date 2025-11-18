@@ -1161,6 +1161,18 @@ impl App<'_> {
                     AppState::Chat { widget } => widget.on_rate_limit_refresh_failed(message),
                     AppState::Onboarding { .. } => {}
                 },
+                AppEvent::RequestGlobalUsageSummary => match &mut self.app_state {
+                    AppState::Chat { widget } => widget.on_request_global_usage_summary(),
+                    AppState::Onboarding { .. } => {}
+                },
+                AppEvent::GlobalUsageSummaryReady { summary } => match &mut self.app_state {
+                    AppState::Chat { widget } => widget.on_global_usage_summary_ready(summary),
+                    AppState::Onboarding { .. } => {}
+                },
+                AppEvent::GlobalUsageSummaryFailed { message } => match &mut self.app_state {
+                    AppState::Chat { widget } => widget.on_global_usage_summary_failed(message),
+                    AppState::Onboarding { .. } => {}
+                },
                 AppEvent::RequestRedraw => {
                     self.schedule_redraw();
                 }

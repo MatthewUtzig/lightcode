@@ -165,8 +165,20 @@ struct RateLimitMetrics {
 
 impl RateLimitMetrics {
     fn from_snapshot(snapshot: &RateLimitSnapshotEvent) -> Self {
-        let hourly_used = snapshot.primary_used_percent.clamp(0.0, 100.0);
-        let weekly_used = snapshot.secondary_used_percent.clamp(0.0, 100.0);
+        let mut hourly_used = snapshot.primary_used_percent.clamp(0.0, 100.0);
+        let mut weekly_used = snapshot.secondary_used_percent.clamp(0.0, 100.0);
+
+        // If the provider reports exhaustion, force 100% so the UI reflects it.
+        if hourly_used >= 100.0 {
+            hourly_used = 100.0;
+        }
+
+        // If the weekly window is unknown/zero, or if the hourly window is zero
+        // (common when providers suppress that bucket), present weekly as fully
+        // used so the UI doesn't imply available capacity.
+        if snapshot.secondary_window_minutes == 0 || snapshot.primary_window_minutes == 0 {
+            weekly_used = 100.0;
+        }
         Self {
             hourly_used,
             weekly_used,
@@ -201,6 +213,9 @@ fn build_summary_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push("/limits".magenta().into());
     lines.push("".into());
+
+    // The TUI now renders a single account-level selection summary in the header;
+    // suppress the per-view line here to avoid duplicate "Selection chance" rows.
 
     if display.show_usage_sections {
         lines.push(section_header("Hourly Limit"));

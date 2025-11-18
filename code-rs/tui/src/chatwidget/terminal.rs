@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use code_ansi_escape::ansi_escape_line;
 use ratatui::text::Line as RtLine;
+use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use vt100::Parser as VtParser;
 
@@ -25,6 +26,7 @@ pub(crate) struct TerminalState {
     pub(crate) after: Option<TerminalAfter>,
     pub(crate) last_visible_rows: Cell<u16>,
     pub(crate) last_visible_cols: Cell<u16>,
+    pub(crate) cancel_hitbox: Cell<Option<Rect>>,
 }
 
 impl TerminalState {
@@ -42,9 +44,18 @@ impl TerminalState {
         self.overlay.as_mut()
     }
 
+    pub(crate) fn cancel_hitbox(&self) -> Option<Rect> {
+        self.cancel_hitbox.get()
+    }
+
+    pub(crate) fn set_cancel_hitbox(&self, rect: Option<Rect>) {
+        self.cancel_hitbox.set(rect);
+    }
+
     pub(crate) fn clear(&mut self) {
         self.overlay = None;
         self.after = None;
+        self.cancel_hitbox.set(None);
     }
 }
 
@@ -659,4 +670,3 @@ fn tint_stderr_line(line: &mut RtLine<'_>) {
         }
     }
 }
-

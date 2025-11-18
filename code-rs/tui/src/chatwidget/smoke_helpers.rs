@@ -115,6 +115,52 @@ impl ChatWidgetHarness {
         harness
     }
 
+    pub fn new_with_home(home: std::path::PathBuf) -> Self {
+        unsafe { std::env::set_var("CODEX_TUI_FAKE_HOUR", "12"); }
+        unsafe { std::env::set_var("CODEX_TUI_FORCE_MINIMAL_HEADER", "1"); }
+        unsafe { std::env::set_var("CODE_TUI_TEST_MODE", "1"); }
+
+        let cfg = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            home,
+        )
+        .expect("config");
+
+        let (tx_raw, rx) = mpsc::channel::<AppEvent>();
+        let app_event_tx = AppEventSender::new(tx_raw);
+        let terminal_info = TerminalInfo {
+            picker: None,
+            font_size: (8, 16),
+        };
+
+        let runtime = &*TEST_RUNTIME;
+        let _guard = runtime.enter();
+
+        let chat = ChatWidget::new(
+            cfg,
+            app_event_tx,
+            None,
+            Vec::new(),
+            false,
+            terminal_info,
+            false,
+            None,
+        );
+
+        let mut harness = Self {
+            chat,
+            events: rx,
+            helper_seq: 0,
+        };
+        harness.chat.auto_state.elapsed_override = Some(Duration::from_secs(1));
+        harness
+    }
+
+    pub fn code_home(&self) -> &std::path::Path {
+        &self.chat.config.code_home
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         self.chat.handle_code_event(event);
     }
@@ -690,6 +736,11 @@ impl ChatWidgetHarness {
         let next = self.helper_seq;
         self.helper_seq = self.helper_seq.saturating_add(1);
         next
+    }
+
+    pub fn show_limits_settings_ui(&mut self) {
+        self.chat.show_limits_settings_ui();
+        self.flush_into_widget();
     }
 }
 

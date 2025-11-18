@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use code_core::{AuthManager, ModelClient, Prompt, ResponseEvent};
+use chrono::Utc;
+use code_core::{account_usage, auth_accounts, AuthManager, ModelClient, Prompt, ResponseEvent};
 use code_core::config::Config;
 use code_core::config_types::ReasoningEffort;
 use code_core::debug_logger::DebugLogger;
@@ -10,6 +11,7 @@ use code_protocol::models::{ContentItem, ResponseItem};
 use futures::StreamExt;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+use tracing::warn;
 
 #[cfg(feature = "code-fork")]
 use crate::tui_event_extensions::handle_rate_limit;
@@ -91,7 +93,21 @@ fn run_refresh(
 
         let proto_snapshot = snapshot.context("rate limit snapshot missing from response")?;
 
-        let snapshot: RateLimitSnapshotEvent = proto_snapshot.clone();
+        let mut snapshot: RateLimitSnapshotEvent = proto_snapshot.clone();
+        let resolved_account_id = snapshot
+            .account_id
+            .clone()
+            .or_else(|| auth_accounts::get_active_account_id(&config.code_home).ok().flatten());
+
+        if snapshot.account_id.is_none() {
+            if let Some(account_id) = resolved_account_id.clone() {
+                snapshot.account_id = Some(account_id);
+            }
+        }
+
+        if let Some(account_id) = snapshot.account_id.clone() {
+            persist_refreshed_snapshot(&config, &account_id, &snapshot);
+        }
 
         #[cfg(feature = "code-fork")]
         handle_rate_limit(&snapshot, &app_event_tx);
@@ -143,4 +159,33 @@ fn build_model_client(
     );
 
     Ok(client)
+}
+
+fn persist_refreshed_snapshot(
+    config: &Config,
+    account_id: &str,
+    snapshot: &RateLimitSnapshotEvent,
+) {
+    let plan = auth_accounts::find_account(&config.code_home, account_id)
+        .ok()
+        .flatten()
+        .and_then(|account| {
+            account
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.id_token.get_chatgpt_plan_type())
+        });
+
+    if let Err(err) = account_usage::record_rate_limit_snapshot(
+        &config.code_home,
+        account_id,
+        plan.as_deref(),
+        snapshot,
+        Utc::now(),
+    ) {
+        warn!(
+            "Failed to persist refreshed rate limit snapshot for {}: {}",
+            account_id, err
+        );
+    }
 }

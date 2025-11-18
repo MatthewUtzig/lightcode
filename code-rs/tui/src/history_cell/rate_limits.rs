@@ -2,6 +2,10 @@ use super::*;
 use crate::history::state::{RateLimitLegendEntry, RateLimitsRecord, TextTone};
 use code_common::elapsed::format_duration;
 use code_core::protocol::RateLimitSnapshotEvent;
+use code_core::auth_accounts;
+use crate::account_label::account_display_label;
+use code_core::config::Config;
+use std::path::PathBuf;
 use ratatui::style::Color;
 use time::{
     format_description::FormatItem,
@@ -12,11 +16,15 @@ use time::{
 
 pub(crate) struct RateLimitsCell {
     record: RateLimitsRecord,
+    code_home: PathBuf,
 }
 
 impl RateLimitsCell {
-    pub(crate) fn from_record(record: RateLimitsRecord) -> Self {
-        Self { record }
+    pub(crate) fn from_record(record: RateLimitsRecord, config: &Config) -> Self {
+        Self {
+            record,
+            code_home: config.code_home.clone(),
+        }
     }
 
     pub(crate) fn record(&self) -> &RateLimitsRecord {
@@ -52,7 +60,7 @@ impl HistoryCell for RateLimitsCell {
             ),
         );
 
-        if let Some(line) = account_line(&self.record) {
+        if let Some(line) = account_line(&self.record, &self.code_home) {
             lines.push(line);
         }
 
@@ -84,14 +92,23 @@ impl HistoryCell for RateLimitsCell {
     }
 }
 
-fn account_line(record: &RateLimitsRecord) -> Option<Line<'static>> {
+fn account_line(record: &RateLimitsRecord, code_home: &PathBuf) -> Option<Line<'static>> {
     let account_id = record
         .account_id
         .as_deref()
         .or(record.snapshot.account_id.as_deref())?;
-    let label = record.account_label.as_deref().filter(|label| !label.is_empty());
+
+    let label = auth_accounts::find_account(code_home, account_id)
+        .ok()
+        .flatten()
+        .map(|acc| account_display_label(&acc))
+        .filter(|l| !l.trim().is_empty())
+        .or_else(|| record.account_label.clone())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+
     let text = match label {
-        Some(label) if label != account_id => format!("Account: {label} ({account_id})"),
+        Some(ref label) if label != account_id => format!("Account: {label} ({account_id})"),
         Some(label) => format!("Account: {label}"),
         None => format!("Account: {account_id}"),
     };

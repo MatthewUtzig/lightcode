@@ -27,6 +27,7 @@ use crate::bottom_pane::{
 };
 use crate::chrome_launch::{ChromeLaunchOption, CHROME_LAUNCH_CHOICES};
 use super::limits_overlay::{LimitsOverlay, LimitsOverlayContent};
+use super::{GlobalUsageState, GlobalUsageStatus};
 use crate::live_wrap::take_prefix_by_width;
 use crate::util::buffer::fill_rect;
 use code_core::config_types::ReasoningEffort;
@@ -808,13 +809,28 @@ pub(crate) struct LimitsSettingsContent {
     overlay: LimitsOverlay,
 }
 
+pub(crate) struct GlobalUsageSettingsContent {
+    state: GlobalUsageState,
+    app_event_tx: AppEventSender,
+    selected_row: usize,
+    is_complete: bool,
+}
+
 impl LimitsSettingsContent {
     pub(crate) fn new(content: LimitsOverlayContent) -> Self {
         Self { overlay: LimitsOverlay::new(content) }
     }
 
-    pub(crate) fn set_content(&mut self, content: LimitsOverlayContent) {
-        self.overlay.set_content(content);
+    pub(crate) fn set_content(&mut self, content: LimitsOverlayContent, preferred_tab: Option<&str>) {
+        self.overlay.set_content(content, preferred_tab);
+    }
+
+    pub(crate) fn selected_tab_title(&self) -> Option<String> {
+        if let Some(tabs) = self.overlay.tabs() {
+            let idx = self.overlay.selected_tab();
+            return tabs.get(idx).map(|t| t.title.clone());
+        }
+        None
     }
 
     fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
@@ -825,7 +841,42 @@ impl LimitsSettingsContent {
         }
 
         if let Some(tabs) = self.overlay.tabs() {
-            let mut spans = Vec::new();
+            use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+            fn truncate_to_width(input: &str, max_width: usize) -> String {
+                if max_width == 0 {
+                    return String::new();
+                }
+                let ellipsis = '…';
+                if UnicodeWidthStr::width(input) <= max_width {
+                    return input.to_string();
+                }
+                let mut collected = String::new();
+                let mut width = 0usize;
+                for ch in input.chars() {
+                    let ch_width = ch.width().unwrap_or(1);
+                    if width + ch_width >= max_width {
+                        break;
+                    }
+                    collected.push(ch);
+                    width += ch_width;
+                }
+                if width + 1 > max_width {
+                    collected
+                } else {
+                    collected.push(ellipsis);
+                    collected
+                }
+            }
+
+            let total_width = area.width as usize;
+            if total_width == 0 {
+                return;
+            }
+
+            let mut lines: Vec<Vec<Span>> = vec![Vec::new()];
+            let mut line_width = 0usize;
+
             for (idx, tab) in tabs.iter().enumerate() {
                 let selected = idx == self.overlay.selected_tab();
                 let style = if selected {
@@ -835,10 +886,42 @@ impl LimitsSettingsContent {
                 } else {
                     Style::default().fg(crate::colors::text_dim())
                 };
-                spans.push(Span::styled(format!(" {} ", tab.title), style));
-                spans.push(Span::raw(" "));
+
+                let mut title = format!(" {} ", tab.title.trim());
+                let mut width = UnicodeWidthStr::width(title.as_str());
+                if width > total_width {
+                    let inner = truncate_to_width(tab.title.trim(), total_width.saturating_sub(2));
+                    title = format!(" {} ", inner);
+                    width = UnicodeWidthStr::width(title.as_str());
+                }
+
+                if line_width + width > total_width && !lines.last().unwrap().is_empty() {
+                    lines.push(Vec::new());
+                    line_width = 0;
+                }
+
+                lines
+                    .last_mut()
+                    .unwrap()
+                    .push(Span::styled(title, style));
+                line_width += width;
+
+                if line_width + 1 <= total_width {
+                    lines.last_mut().unwrap().push(Span::raw(" "));
+                    line_width += 1;
+                } else {
+                    lines.push(Vec::new());
+                    line_width = 0;
+                }
             }
-            Paragraph::new(Line::from(spans))
+
+            let rendered_lines: Vec<Line<'static>> = lines
+                .into_iter()
+                .filter(|spans| !spans.is_empty())
+                .map(|spans| Line::from(spans))
+                .collect();
+
+            Paragraph::new(rendered_lines)
                 .style(Style::default().bg(crate::colors::background()))
                 .render(area, buf);
         }
@@ -994,6 +1077,160 @@ impl SettingsContent for LimitsSettingsContent {
 
     fn is_complete(&self) -> bool {
         false
+    }
+}
+
+impl GlobalUsageSettingsContent {
+    pub(crate) fn new(state: GlobalUsageState, app_event_tx: AppEventSender) -> Self {
+        Self {
+            state,
+            app_event_tx,
+            selected_row: 0,
+            is_complete: false,
+        }
+    }
+
+    pub(crate) fn update_state(&mut self, state: GlobalUsageState) {
+        self.state = state;
+        if matches!(self.state.status, GlobalUsageStatus::Processing) {
+            self.selected_row = 0;
+        }
+    }
+
+    fn render_action_row(&self, selected: bool, label: &str) -> Line<'static> {
+        let mut spans = Vec::new();
+        let indicator = if selected { "› " } else { "  " };
+        spans.push(Span::styled(indicator, Style::default().fg(if selected {
+            crate::colors::primary()
+        } else {
+            crate::colors::text_dim()
+        })));
+        spans.push(Span::styled(
+            label.to_string(),
+            if selected {
+                Style::default()
+                    .fg(crate::colors::primary())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(crate::colors::text())
+            },
+        ));
+        Line::from(spans)
+    }
+
+    fn status_line(&self) -> Line<'static> {
+        let (text, style) = match self.state.status {
+            GlobalUsageStatus::Idle => (
+                "Idle",
+                Style::default().fg(crate::colors::text_dim()),
+            ),
+            GlobalUsageStatus::Processing => (
+                "Processing…",
+                Style::default().fg(crate::colors::function()),
+            ),
+            GlobalUsageStatus::Ready => (
+                "Ready",
+                Style::default().fg(crate::colors::success()),
+            ),
+            GlobalUsageStatus::Error => (
+                "Error",
+                Style::default().fg(crate::colors::error()),
+            ),
+        };
+        Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(crate::colors::text_dim())),
+            Span::styled(text.to_string(), style),
+        ])
+    }
+}
+
+impl SettingsContent for GlobalUsageSettingsContent {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        fill_rect(
+            buf,
+            area,
+            Some(' '),
+            Style::default().bg(crate::colors::background()),
+        );
+
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(self.status_line());
+        lines.push(Line::default());
+
+        let run_label = if matches!(self.state.status, GlobalUsageStatus::Processing) {
+            "Computing global usage…"
+        } else {
+            "Run global usage computation"
+        };
+        lines.push(self.render_action_row(self.selected_row == 0, run_label));
+        lines.push(self.render_action_row(self.selected_row == 1, "Close"));
+        lines.push(Line::default());
+
+        if let Some(summary) = &self.state.summary {
+            lines.push(Line::from(Span::styled(
+                summary.clone(),
+                Style::default().fg(crate::colors::text()),
+            )));
+        } else if matches!(self.state.status, GlobalUsageStatus::Idle) {
+            lines.push(Line::from(Span::styled(
+                "Press Enter to compute token usage across all linked accounts.",
+                Style::default().fg(crate::colors::text_dim()),
+            )));
+        }
+
+        if let Some(error) = &self.state.last_error {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(crate::colors::error()),
+            )));
+        }
+
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if self.selected_row > 0 {
+                    self.selected_row -= 1;
+                }
+                true
+            }
+            KeyCode::Down => {
+                if self.selected_row < 1 {
+                    self.selected_row += 1;
+                }
+                true
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self.selected_row == 0 {
+                    if !matches!(self.state.status, GlobalUsageStatus::Processing) {
+                        self.app_event_tx
+                            .send(AppEvent::RequestGlobalUsageSummary);
+                    }
+                } else {
+                    self.is_complete = true;
+                }
+                true
+            }
+            KeyCode::Esc => {
+                self.is_complete = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.is_complete
     }
 }
 
@@ -1175,6 +1412,7 @@ pub(crate) struct SettingsOverlayView {
     auto_drive_content: Option<AutoDriveSettingsContent>,
     limits_content: Option<LimitsSettingsContent>,
     chrome_content: Option<ChromeSettingsContent>,
+    global_usage_content: Option<GlobalUsageSettingsContent>,
 }
 
 impl SettingsOverlayView {
@@ -1197,6 +1435,7 @@ impl SettingsOverlayView {
             auto_drive_content: None,
             limits_content: None,
             chrome_content: None,
+            global_usage_content: None,
         }
     }
 
@@ -1301,6 +1540,10 @@ impl SettingsOverlayView {
         self.chrome_content = Some(content);
     }
 
+    pub(crate) fn set_global_usage_content(&mut self, content: GlobalUsageSettingsContent) {
+        self.global_usage_content = Some(content);
+    }
+
     #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
     pub(crate) fn agents_content(&self) -> Option<&AgentsSettingsContent> {
         self.agents_content.as_ref()
@@ -1316,6 +1559,14 @@ impl SettingsOverlayView {
 
     pub(crate) fn limits_content_mut(&mut self) -> Option<&mut LimitsSettingsContent> {
         self.limits_content.as_mut()
+    }
+
+    pub(crate) fn limits_content(&self) -> Option<&LimitsSettingsContent> {
+        self.limits_content.as_ref()
+    }
+
+    pub(crate) fn global_usage_content_mut(&mut self) -> Option<&mut GlobalUsageSettingsContent> {
+        self.global_usage_content.as_mut()
     }
 
     pub(crate) fn set_section(&mut self, section: SettingsSection) -> bool {
@@ -1766,6 +2017,7 @@ impl SettingsOverlayView {
             SettingsSection::Chrome => "Chrome Launch Options",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Mcp => "MCP Servers",
+            SettingsSection::GlobalUsage => "Global Usage",
         }
     }
 
@@ -2125,6 +2377,13 @@ impl SettingsOverlayView {
                 }
                 self.render_placeholder(area, buf, SettingsSection::Mcp.placeholder());
             }
+            SettingsSection::GlobalUsage => {
+                if let Some(content) = self.global_usage_content.as_ref() {
+                    content.render(area, buf);
+                    return;
+                }
+                self.render_placeholder(area, buf, SettingsSection::GlobalUsage.placeholder());
+            }
         }
     }
 
@@ -2189,6 +2448,10 @@ impl SettingsOverlayView {
                 .mcp_content
                 .as_mut()
                 .map(|content| content as &mut dyn SettingsContent),
+            SettingsSection::GlobalUsage => self
+                .global_usage_content
+                .as_mut()
+                .map(|content| content as &mut dyn SettingsContent),
         }
     }
 
@@ -2216,6 +2479,11 @@ impl SettingsOverlayView {
             }
             SettingsSection::Chrome => {
                 if let Some(content) = self.chrome_content.as_mut() {
+                    content.on_close();
+                }
+            }
+            SettingsSection::GlobalUsage => {
+                if let Some(content) = self.global_usage_content.as_mut() {
                     content.on_close();
                 }
             }

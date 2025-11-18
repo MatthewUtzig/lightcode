@@ -47,11 +47,20 @@ impl LimitsOverlay {
         }
     }
 
-    pub(crate) fn set_content(&mut self, content: LimitsOverlayContent) {
+    pub(crate) fn set_content(&mut self, content: LimitsOverlayContent, preferred_tab: Option<&str>) {
+        let mut next_selected = 0usize;
+        if let Some(name) = preferred_tab {
+            if let LimitsOverlayContent::Tabs(tabs) = &content {
+                if let Some(idx) = tabs.iter().position(|t| t.title == name) {
+                    next_selected = idx;
+                }
+            }
+        }
+
         self.content = content;
         self.scroll.set(0);
         self.max_scroll.set(0);
-        self.selected_tab.set(0);
+        self.selected_tab.set(next_selected);
     }
 
     pub(crate) fn scroll(&self) -> u16 {
@@ -280,4 +289,37 @@ fn line_text(line: &RtLine<'static>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tab(title: &str) -> LimitsTab {
+        LimitsTab::message(title.to_string(), Vec::new(), vec![RtLine::from("body")])
+    }
+
+    #[test]
+    fn preserves_selected_tab_when_preference_exists() {
+        let mut overlay = LimitsOverlay::new(LimitsOverlayContent::Tabs(vec![
+            make_tab("A"),
+            make_tab("B"),
+            make_tab("C"),
+        ]));
+        overlay.select_next_tab();
+        overlay.select_next_tab();
+
+        let replacement = LimitsOverlayContent::Tabs(vec![make_tab("B"), make_tab("C"), make_tab("D")]);
+        overlay.set_content(replacement, Some("C"));
+        assert_eq!(overlay.selected_tab(), 1);
+    }
+
+    #[test]
+    fn resets_selected_tab_when_preference_missing() {
+        let mut overlay = LimitsOverlay::new(LimitsOverlayContent::Tabs(vec![make_tab("Alpha"), make_tab("Beta")]));
+        overlay.select_next_tab();
+        let replacement = LimitsOverlayContent::Tabs(vec![make_tab("Gamma"), make_tab("Delta")]);
+        overlay.set_content(replacement, Some("missing"));
+        assert_eq!(overlay.selected_tab(), 0);
+    }
 }

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use code_app_server_protocol::AuthMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 use crate::auth;
 use crate::config::resolve_code_path_for_read;
 use crate::token_data::TokenData;
+use dirs::home_dir;
 
 const ACCOUNTS_FILE_NAME: &str = "auth_accounts.json";
 const SLOT_PREFIX: &str = "slot";
@@ -333,19 +335,52 @@ fn discover_slot_accounts(code_home: &Path) -> io::Result<Vec<StoredAccount>> {
         }
     }
 
+    // Also surface a virtual "default" slot that points at the primary auth
+    // file even when no slot directories exist.
+    if let Err(err) = push_default_slot_account(code_home, &mut seen_ids, &mut accounts) {
+        if err.kind() != ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+
     accounts.sort_by(|a, b| slot_display_key(a).cmp(&slot_display_key(b)));
     Ok(accounts)
 }
 
 fn slot_roots(code_home: &Path) -> Vec<PathBuf> {
+    fn push_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
+        if candidate.exists() && !roots.iter().any(|root| root == &candidate) {
+            roots.push(candidate);
+        }
+    }
+
     let mut roots = vec![code_home.to_path_buf()];
     let read_path = resolve_code_path_for_read(code_home, Path::new("auth.json"));
     if let Some(parent) = read_path.parent() {
-        if !roots.iter().any(|root| root == parent) {
-            roots.push(parent.to_path_buf());
-        }
+        push_root(&mut roots, parent.to_path_buf());
+    }
+    if let Some(legacy) = legacy_code_home_dir() {
+        push_root(&mut roots, legacy);
     }
     roots
+}
+
+fn legacy_code_home_dir() -> Option<PathBuf> {
+    if env_overrides_present() {
+        return None;
+    }
+    let home = home_dir()?;
+    let candidate = home.join(".codex");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn env_overrides_present() -> bool {
+    matches!(env::var("CODE_HOME"), Ok(ref v) if !v.trim().is_empty())
+        || matches!(env::var("CODEX_HOME"), Ok(ref v) if !v.trim().is_empty())
 }
 
 fn scan_slot_root(
@@ -353,6 +388,10 @@ fn scan_slot_root(
     seen_ids: &mut HashSet<String>,
     out: &mut Vec<StoredAccount>,
 ) -> io::Result<()> {
+    // Prefer the same canonical default selection that the CLI uses when it
+    // resolves auth.json for ChatGPT flows. We intentionally do NOT consider
+    // the OPENAI_API_KEY env var here because slot-default is meant to mirror
+    // the persisted default ChatGPT identity, not ad-hoc environment overrides.
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -443,23 +482,57 @@ fn push_slot_account(
 ) {
     let base_id = make_slot_id_slug(components);
     let id = ensure_unique_slot_id(&base_id, seen_ids);
-    let label = format!("Slot {}", slot_label(components));
+    let mut label = format!("Slot {}", slot_label(components));
+    let mut tokens = auth_json.tokens.clone();
     let mode = if auth_json.tokens.is_some() {
         AuthMode::ChatGPT
     } else {
         AuthMode::ApiKey
     };
 
+    if let (AuthMode::ChatGPT, Some(tokens_ref)) = (&mode, auth_json.tokens.as_ref()) {
+        if let Some(email) = tokens_ref.id_token.email.as_deref() {
+            let trimmed = email.trim();
+            if !trimmed.is_empty() {
+                label = trimmed.to_string();
+            }
+        }
+
+        // Ensure we always retain the account_id when constructing slot accounts.
+        // Some token captures drop account_id; mirror CLI default behavior by
+        // preserving whatever was present in auth.json.
+        if tokens_ref.account_id.is_none() {
+            tokens = Some(tokens_ref.clone());
+        }
+    }
+
     out.push(StoredAccount {
         id,
         mode,
         label: Some(label),
         openai_api_key: auth_json.openai_api_key,
-        tokens: auth_json.tokens,
+        tokens,
         last_refresh: auth_json.last_refresh,
         created_at: None,
         last_used_at: None,
     });
+}
+
+fn push_default_slot_account(
+    code_home: &Path,
+    seen_ids: &mut HashSet<String>,
+    out: &mut Vec<StoredAccount>,
+) -> io::Result<()> {
+    let auth_json = match auth::load_default_chatgpt_auth(code_home)? {
+        Some(json) => json,
+        None => return Ok(()),
+    };
+    // Ignore pure API-key-only auth; slot-default should mirror the ChatGPT identity.
+    if auth_json.tokens.is_none() && auth_json.openai_api_key.is_none() {
+        return Ok(());
+    }
+    push_slot_account(auth_json, &["default".to_string()], seen_ids, out);
+    Ok(())
 }
 
 fn slot_display_key(account: &StoredAccount) -> String {
@@ -564,6 +637,7 @@ mod tests {
     use crate::auth::{write_auth_json, AuthDotJson};
     use crate::token_data::{IdTokenInfo, TokenData};
     use tempfile::tempdir;
+    use std::env;
 
     fn make_chatgpt_tokens(account_id: Option<&str>, email: Option<&str>) -> TokenData {
         fn fake_jwt(account_id: Option<&str>, email: Option<&str>, plan: &str) -> String {
@@ -744,6 +818,37 @@ mod tests {
     }
 
     #[test]
+    fn default_slot_is_exposed_from_root_auth() {
+        let home = tempdir().expect("tempdir");
+        let tokens = make_chatgpt_tokens(Some("acct-default"), Some("user@example.com"));
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(tokens.clone()),
+            last_refresh: Some(Utc::now()),
+        };
+        write_auth_json(&home.path().join("auth.json"), &auth).expect("write auth");
+
+        let accounts = list_accounts(home.path()).expect("list");
+        let slot = accounts
+            .iter()
+            .find(|acc| acc.id == "slot-default")
+            .expect("slot-default missing");
+
+        assert_eq!(slot.mode, AuthMode::ChatGPT);
+        assert_eq!(
+            slot
+                .tokens
+                .as_ref()
+                .and_then(|t| t.account_id.as_deref()),
+            tokens.account_id.as_deref()
+        );
+        assert!(slot
+            .label
+            .as_ref()
+            .is_some_and(|label| label.contains("Slot default")));
+    }
+
+    #[test]
     fn nested_slot_directories_are_discovered() {
         let home = tempdir().expect("tempdir");
         let nested = home.path().join("slot").join("beta");
@@ -763,5 +868,67 @@ mod tests {
             .expect("slot not discovered");
         assert_eq!(slot_account.mode, AuthMode::ApiKey);
         assert!(slot_account.id.starts_with("slot-"));
+    }
+
+    #[test]
+    fn default_slot_prefers_legacy_codex_auth() {
+        let original_home = env::var("HOME").ok();
+        let temp_home = tempdir().expect("tempdir");
+        env::set_var("HOME", temp_home.path());
+
+        let code_home = temp_home.path().join(".code");
+        std::fs::create_dir_all(&code_home).expect("code home");
+
+        let legacy_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy");
+
+        let primary_tokens = TokenData {
+            id_token: IdTokenInfo {
+                email: Some("primary@example.com".to_string()),
+                ..Default::default()
+            },
+            access_token: "access-primary".to_string(),
+            refresh_token: "refresh-primary".to_string(),
+            account_id: Some("acct-primary".to_string()),
+        };
+        let legacy_auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(primary_tokens.clone()),
+            last_refresh: None,
+        };
+        write_auth_json(&legacy_dir.join("auth.json"), &legacy_auth).expect("write legacy auth");
+
+        let secondary_tokens = TokenData {
+            id_token: IdTokenInfo {
+                email: Some("secondary@example.com".to_string()),
+                ..Default::default()
+            },
+            access_token: "access-secondary".to_string(),
+            refresh_token: "refresh-secondary".to_string(),
+            account_id: Some("acct-secondary".to_string()),
+        };
+        let primary_auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(secondary_tokens),
+            last_refresh: None,
+        };
+        write_auth_json(&code_home.join("auth.json"), &primary_auth).expect("write code auth");
+
+        let accounts = list_accounts(&code_home).expect("list accounts");
+        let slot_default = accounts
+            .iter()
+            .find(|acc| acc.id == "slot-default")
+            .expect("slot-default missing");
+
+        let email = slot_default
+            .tokens
+            .as_ref()
+            .and_then(|t| t.id_token.email.as_deref())
+            .unwrap_or("");
+        assert_eq!(email, "primary@example.com");
+
+        if let Some(prev) = original_home {
+            env::set_var("HOME", prev);
+        }
     }
 }

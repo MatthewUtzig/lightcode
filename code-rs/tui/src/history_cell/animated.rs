@@ -1,6 +1,13 @@
 use super::*;
+use crate::glitch_animation::{self, IntroColorMode, SPARKSI_LIME_GREEN, SPARKSI_LIGHT_BLUE};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
+
+const INTRO_ANIMATION_DURATION: Duration = Duration::from_secs(2);
+const INTRO_FADE_DURATION: Duration = Duration::from_millis(800);
+const INTRO_PUSH_DURATION: Duration = Duration::from_millis(900);
+const AVENUE_WORD: &str = "AVENUE";
+const SPARKSI_WORD: &str = "SPARKSI";
 
 pub(crate) struct AnimatedWelcomeCell {
     start_time: Instant,
@@ -9,6 +16,8 @@ pub(crate) struct AnimatedWelcomeCell {
     faded_out: Cell<bool>,
     locked_height: Cell<Option<u16>>,
     hidden: Cell<bool>,
+    push_start: RefCell<Option<Instant>>,
+    push_completed: Cell<bool>,
 }
 
 impl AnimatedWelcomeCell {
@@ -20,6 +29,8 @@ impl AnimatedWelcomeCell {
             faded_out: Cell::new(false),
             locked_height: Cell::new(None),
             hidden: Cell::new(false),
+            push_start: RefCell::new(None),
+            push_completed: Cell::new(false),
         }
     }
 
@@ -101,51 +112,122 @@ impl HistoryCell for AnimatedWelcomeCell {
             height,
         };
 
-        let fade_duration = Duration::from_millis(800);
-
+        // Phase 1: AVENUE animation / fade
         if let Some(fade_time) = self.fade_start() {
             let fade_elapsed = fade_time.elapsed();
-            if fade_elapsed < fade_duration && !self.faded_out.get() {
-                let fade_progress = fade_elapsed.as_secs_f32() / fade_duration.as_secs_f32();
-                let alpha = 1.0 - fade_progress;
-                crate::glitch_animation::render_intro_animation_with_alpha(
+            let fade_progress = fade_elapsed.as_secs_f32() / INTRO_FADE_DURATION.as_secs_f32();
+            let alpha = (1.0 - fade_progress).clamp(0.0, 1.0);
+            if fade_elapsed < INTRO_FADE_DURATION && !self.push_completed.get() {
+                glitch_animation::render_intro_word_with_options(
                     positioned_area,
                     buf,
                     1.0,
-                    alpha,
+                    Some(alpha),
+                    AVENUE_WORD,
+                    IntroColorMode::Rainbow,
+                    0,
+                    true,
+                );
+            }
+            // Kick off push phase near the end of fade if not already started
+            if fade_elapsed >= INTRO_FADE_DURATION.saturating_sub(Duration::from_millis(400))
+                && self.push_start.borrow().is_none()
+            {
+                *self.push_start.borrow_mut() = Some(Instant::now());
+            }
+        } else {
+            let elapsed = self.start_time.elapsed();
+            if elapsed < INTRO_ANIMATION_DURATION && !self.completed.get() {
+                let progress = elapsed.as_secs_f32() / INTRO_ANIMATION_DURATION.as_secs_f32();
+                glitch_animation::render_intro_word_with_options(
+                    positioned_area,
+                    buf,
+                    progress,
+                    None,
+                    AVENUE_WORD,
+                    IntroColorMode::Rainbow,
+                    0,
+                    true,
                 );
             } else {
-                self.faded_out.set(true);
+                self.completed.set(true);
+                self.set_fade_start();
+                glitch_animation::render_intro_word_with_options(
+                    positioned_area,
+                    buf,
+                    1.0,
+                    None,
+                    AVENUE_WORD,
+                    IntroColorMode::Rainbow,
+                    0,
+                    true,
+                );
             }
-            return;
         }
 
-        let elapsed = self.start_time.elapsed();
-        let animation_duration = Duration::from_secs(2);
-        if elapsed < animation_duration && !self.completed.get() {
-            let progress = elapsed.as_secs_f32() / animation_duration.as_secs_f32();
-            crate::glitch_animation::render_intro_animation(positioned_area, buf, progress);
-        } else {
-            self.completed.set(true);
-            crate::glitch_animation::render_intro_animation(positioned_area, buf, 1.0);
+        // Phase 2: SPARKSI pushes AVENUE off-screen once fade is underway/completed
+        if let Some(push_time) = self.push_start.borrow().as_ref() {
+            let push_elapsed = push_time.elapsed();
+            let push_t = (push_elapsed.as_secs_f32()
+                / INTRO_PUSH_DURATION.as_secs_f32())
+                .clamp(0.0, 1.0);
+
+            // Compute horizontal offsets: SPARKSI moves from left offscreen to center; AVENUE moves right offscreen
+            let width = positioned_area.width as i32;
+            let avenue_offset = (push_t * width as f32) as i32; // shove right
+            let sparksi_offset = -width + (push_t * width as f32) as i32; // enter from left
+
+            glitch_animation::render_intro_word_with_options(
+                positioned_area,
+                buf,
+                1.0,
+                Some(0.0),
+                AVENUE_WORD,
+                IntroColorMode::Rainbow,
+                avenue_offset,
+                false,
+            );
+
+            glitch_animation::render_intro_word_with_options(
+                positioned_area,
+                buf,
+                1.0,
+                Some(1.0),
+                SPARKSI_WORD,
+                IntroColorMode::Gradient {
+                    start: SPARKSI_LIGHT_BLUE,
+                    end: SPARKSI_LIME_GREEN,
+                },
+                sparksi_offset,
+                false,
+            );
+
+            if push_elapsed >= INTRO_PUSH_DURATION {
+                self.push_completed.set(true);
+                self.faded_out.set(true);
+            }
         }
     }
 
     fn is_animating(&self) -> bool {
-        let animation_duration = Duration::from_secs(2);
         if !self.completed.get() {
-            if self.start_time.elapsed() < animation_duration {
+            if self.start_time.elapsed() < INTRO_ANIMATION_DURATION {
                 return true;
             }
             self.completed.set(true);
         }
 
         if let Some(fade_time) = self.fade_start() {
-            if !self.faded_out.get() {
-                if fade_time.elapsed() < Duration::from_millis(800) {
+            if !self.faded_out.get() || !self.push_completed.get() {
+                if fade_time.elapsed() < INTRO_FADE_DURATION {
                     return true;
                 }
-                self.faded_out.set(true);
+            }
+        }
+
+        if let Some(push_time) = self.push_start.borrow().as_ref() {
+            if push_time.elapsed() < INTRO_PUSH_DURATION {
+                return true;
             }
         }
 

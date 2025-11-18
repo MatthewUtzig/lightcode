@@ -6024,7 +6024,9 @@ pub(crate) fn cell_from_record(record: &crate::history::state::HistoryRecord, cf
         HistoryRecord::Explore(state) => {
             Box::new(explore::ExploreAggregationCell::from_record(state.clone()))
         }
-        HistoryRecord::RateLimits(state) => Box::new(rate_limits::RateLimitsCell::from_record(state.clone())),
+        HistoryRecord::RateLimits(state) => {
+            Box::new(rate_limits::RateLimitsCell::from_record(state.clone(), cfg))
+        }
         HistoryRecord::Patch(state) => Box::new(PatchSummaryCell::from_record(state.clone())),
         HistoryRecord::BackgroundEvent(state) => Box::new(background::BackgroundEventCell::new(state.clone())),
         HistoryRecord::Notice(state) => Box::new(PlainHistoryCell::from_notice_record(state.clone())),

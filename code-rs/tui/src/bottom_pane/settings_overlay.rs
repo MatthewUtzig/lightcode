@@ -12,10 +12,11 @@ pub(crate) enum SettingsSection {
     Chrome,
     Mcp,
     Notifications,
+    GlobalUsage,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [SettingsSection; 12] = [
+    pub(crate) const ALL: [SettingsSection; 13] = [
         SettingsSection::Model,
         SettingsSection::Theme,
         SettingsSection::Updates,
@@ -28,6 +29,7 @@ impl SettingsSection {
         SettingsSection::Mcp,
         SettingsSection::Notifications,
         SettingsSection::Limits,
+        SettingsSection::GlobalUsage,
     ];
 
     pub(crate) const fn label(self) -> &'static str {
@@ -44,6 +46,7 @@ impl SettingsSection {
             SettingsSection::Chrome => "Chrome",
             SettingsSection::Mcp => "MCP",
             SettingsSection::Notifications => "Notifications",
+            SettingsSection::GlobalUsage => "Global Usage",
         }
     }
 
@@ -61,6 +64,9 @@ impl SettingsSection {
             SettingsSection::Chrome => "Connect to Chrome or switch browser integrations.",
             SettingsSection::Mcp => "Enable and manage local MCP servers for tooling.",
             SettingsSection::Notifications => "Adjust desktop and terminal notification preferences.",
+            SettingsSection::GlobalUsage => {
+                "Compute a global token usage summary across all accounts."
+            }
         }
     }
 
@@ -78,6 +84,7 @@ impl SettingsSection {
             SettingsSection::Chrome => "Chrome integration settings coming soon.",
             SettingsSection::Mcp => "MCP server management coming soon.",
             SettingsSection::Notifications => "Notification preferences coming soon.",
+            SettingsSection::GlobalUsage => "Run a global token usage summary.",
         }
     }
 
@@ -95,6 +102,7 @@ impl SettingsSection {
             "chrome" | "browser" => Some(SettingsSection::Chrome),
             "mcp" => Some(SettingsSection::Mcp),
             "notification" | "notifications" | "notify" | "notif" => Some(SettingsSection::Notifications),
+            "global" | "globalusage" | "global-usage" => Some(SettingsSection::GlobalUsage),
             _ => None,
         }
     }

@@ -5549,22 +5549,23 @@ async fn run_turn(
     let mut attempt_input: Vec<ResponseItem> = input.clone();
     let scheduler_handle = sess.account_scheduler();
     let mut scheduler_active = scheduler_handle.is_some();
-    let mut selected_account: Option<AccountSelection> = None;
-    let mut need_new_account = scheduler_handle.is_some();
+    let mut selected_account: Option<AccountSelection>;
     loop {
-        if scheduler_active && (need_new_account || selected_account.is_none()) {
+        selected_account = if scheduler_active {
             if let Some(handle) = scheduler_handle.as_ref() {
                 if let Some(selection) = select_scheduler_account(handle) {
                     ensure_account_is_active(sess, &selection)?;
-                    selected_account = Some(selection);
-                    need_new_account = false;
+                    Some(selection)
                 } else {
                     scheduler_active = false;
-                    selected_account = None;
-                    need_new_account = false;
+                    None
                 }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Each loop iteration corresponds to a single provider HTTP request.
         // Increment the attempt ordinal first and capture its value so all
@@ -5655,13 +5656,24 @@ async fn run_turn(
                         resume_at,
                     )
                 {
-                    need_new_account = scheduler_handle.is_some();
                     continue;
                 }
 
                 return Err(e);
             }
             Err(e) => {
+                if scheduler_active {
+                    if let CodexErr::Stream(_, Some(ref retry_after)) = e {
+                        if scheduler_should_retry(
+                            &scheduler_handle,
+                            &mut selected_account,
+                            Some(retry_after.resume_at),
+                        ) {
+                            continue;
+                        }
+                    }
+                }
+
                 // Detect context-window overflow and auto-run a compact summarization once
                 if !did_auto_compact {
                     if let CodexErr::Stream(msg, _maybe_delay) = &e {

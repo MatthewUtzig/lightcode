@@ -45,11 +45,14 @@ use code_core::model_family::derive_default_model_family;
 use code_core::model_family::find_family_for_model;
 use code_core::account_usage::{
     self,
+    load_aggregate_rate_limit_snapshot,
     RateLimitWarningScope,
     StoredRateLimitSnapshot,
     StoredUsageSummary,
     TokenTotals,
+    AGGREGATE_ACCOUNT_ID,
 };
+use code_core::account_scheduler::{compute_weight, slot_identity};
 use code_core::auth_accounts::{self, StoredAccount};
 use code_login::AuthManager;
 use code_login::AuthMode;
@@ -57,6 +60,46 @@ use code_protocol::mcp_protocol::AuthMode as McpAuthMode;
 use code_protocol::protocol::SessionSource;
 use code_protocol::num_format::format_with_separators;
 use code_core::split_command_and_args;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LimitOverrideKind {
+    Weekly,
+    Hourly,
+}
+
+struct SlotChanceInput {
+    account_id: String,
+    label: String,
+    weight: f64,
+    identity: String,
+    out_of_tokens: bool,
+    reset: Option<DateTime<Utc>>,
+    override_kind: Option<LimitOverrideKind>,
+}
+
+#[derive(Clone, Debug)]
+struct SlotChance {
+    label: String,
+    percentage: f64,
+    reset: Option<DateTime<Utc>>,
+    override_kind: Option<LimitOverrideKind>,
+}
+
+#[derive(Clone, Debug)]
+struct AccountChance {
+    account_percentage: f64,
+    slot_count: usize,
+    slots: Vec<SlotChance>,
+    duplicate_notice: Option<String>,
+    out_of_tokens: bool,
+    out_of_tokens_reset: Option<DateTime<Utc>>,
+    override_kind: Option<LimitOverrideKind>,
+}
+
+#[derive(Clone, Debug)]
+struct SelectionChanceSummary {
+    accounts: HashMap<String, AccountChance>,
+}
 
 
 mod diff_handlers;
@@ -74,6 +117,7 @@ mod layout_scroll;
 mod message;
 mod perf;
 mod rate_limit_refresh;
+mod global_usage_refresh;
 mod streaming;
 mod terminal_handlers;
 mod terminal;
@@ -122,6 +166,7 @@ use code_auto_drive_core::{
 use self::limits_overlay::{LimitsOverlayContent, LimitsTab};
 use crate::chrome_launch::ChromeLaunchOption;
 use self::rate_limit_refresh::start_rate_limit_refresh;
+use self::global_usage_refresh::start_global_usage_refresh;
 use self::history_render::{
     CachedLayout, HistoryRenderState, RenderRequest, RenderRequestKind, RenderSettings, VisibleCell,
 };
@@ -869,6 +914,10 @@ fn status_content_prefix() -> String {
     STATUS_CONTENT_PREFIX.to_string()
 }
 
+fn is_slot_account_id(account_id: &str) -> bool {
+    account_id.starts_with("slot-")
+}
+
 fn describe_cloud_error(err: &CloudTaskError) -> String {
     match err {
         CloudTaskError::Msg(message) => message.clone(),
@@ -1328,6 +1377,9 @@ pub(crate) struct ChatWidget<'a> {
 
     // Limits overlay state
     limits: LimitsState,
+
+    // Global usage state for settings overlay
+    global_usage: GlobalUsageState,
 
     // Terminal overlay state
     terminal: TerminalState,
@@ -1994,6 +2046,7 @@ use self::settings_overlay::{
     AgentOverviewRow,
     AutoDriveSettingsContent,
     AgentsSettingsContent,
+    GlobalUsageSettingsContent,
     GithubSettingsContent,
     LimitsSettingsContent,
     ChromeSettingsContent,
@@ -5031,6 +5084,7 @@ impl ChatWidget<'_> {
             },
             settings: SettingsState::default(),
             limits: LimitsState::default(),
+            global_usage: GlobalUsageState::default(),
             terminal: TerminalState::default(),
             pending_manual_terminal: HashMap::new(),
             agents_overview_selected_index: 0,
@@ -5132,6 +5186,7 @@ impl ChatWidget<'_> {
                 }
             }
         }
+        new_widget.prime_cached_rate_limits();
         // Seed footer access indicator based on current config
         new_widget.apply_access_mode_indicator_from_config();
         // Insert the welcome cell as top-of-first-request so future model output
@@ -5358,6 +5413,7 @@ impl ChatWidget<'_> {
             },
             settings: SettingsState::default(),
             limits: LimitsState::default(),
+            global_usage: GlobalUsageState::default(),
             terminal: TerminalState::default(),
             pending_manual_terminal: HashMap::new(),
             agents_overview_selected_index: 0,
@@ -5458,6 +5514,7 @@ impl ChatWidget<'_> {
                 }
             }
         }
+        w.prime_cached_rate_limits();
         w.set_standard_terminal_mode(!config.tui.alternate_screen);
         if show_welcome {
             w.history_push_top_next_req(history_cell::new_animated_welcome());
@@ -6635,8 +6692,8 @@ impl ChatWidget<'_> {
         }
     }
 
-    fn set_limits_overlay_content(&mut self, content: LimitsOverlayContent) {
-        let handled_by_settings = self.update_limits_settings_content(content.clone());
+    fn set_limits_overlay_content(&mut self, content: LimitsOverlayContent, preferred_tab: Option<String>) {
+        let handled_by_settings = self.update_limits_settings_content_with_preference(content.clone(), preferred_tab.as_deref());
         if handled_by_settings {
             self.limits.cached_content = None;
         } else {
@@ -6644,10 +6701,10 @@ impl ChatWidget<'_> {
         }
     }
 
-    fn update_limits_settings_content(&mut self, content: LimitsOverlayContent) -> bool {
+    fn update_limits_settings_content_with_preference(&mut self, content: LimitsOverlayContent, preferred_tab: Option<&str>) -> bool {
         if let Some(overlay) = self.settings.overlay.as_mut() {
             if let Some(view) = overlay.limits_content_mut() {
-                view.set_content(content);
+                view.set_content(content, preferred_tab);
             } else {
                 overlay.set_limits_content(LimitsSettingsContent::new(content));
             }
@@ -6659,12 +6716,329 @@ impl ChatWidget<'_> {
     }
 
     fn set_limits_overlay_tabs(&mut self, tabs: Vec<LimitsTab>) {
+        let preferred_tab = self.current_limits_tab_title();
         let content = if tabs.is_empty() {
             LimitsOverlayContent::Placeholder
         } else {
             LimitsOverlayContent::Tabs(tabs)
         };
-        self.set_limits_overlay_content(content);
+        self.set_limits_overlay_content(content, preferred_tab);
+    }
+
+    fn current_limits_tab_title(&self) -> Option<String> {
+        self.settings
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.limits_content())
+            .and_then(|content| content.selected_tab_title())
+    }
+
+    fn slot_reset_metadata(
+        snapshot: &StoredRateLimitSnapshot,
+    ) -> (Option<DateTime<Utc>>, Option<LimitOverrideKind>) {
+        let secondary_reset = snapshot.secondary_next_reset_at;
+        let primary_reset = snapshot.primary_next_reset_at;
+        let has_secondary_reset = snapshot
+            .snapshot
+            .as_ref()
+            .and_then(|event| event.secondary_reset_after_seconds)
+            .is_some();
+
+        if let Some(reset) = secondary_reset {
+            if has_secondary_reset {
+                return (Some(reset), Some(LimitOverrideKind::Weekly));
+            }
+            if primary_reset.is_some() {
+                return (Some(reset), Some(LimitOverrideKind::Hourly));
+            }
+            return (Some(reset), Some(LimitOverrideKind::Weekly));
+        }
+
+        if let Some(reset) = primary_reset {
+            return (Some(reset), Some(LimitOverrideKind::Hourly));
+        }
+
+        (None, None)
+    }
+
+    fn compute_selection_chances(
+        account_map: &HashMap<String, StoredAccount>,
+        snapshot_map: &HashMap<String, StoredRateLimitSnapshot>,
+    ) -> SelectionChanceSummary {
+        let now = chrono::Utc::now();
+        let mut total_weight = 0.0;
+        let mut slots: Vec<SlotChanceInput> = Vec::new();
+        let mut identity_counts: HashMap<String, usize> = HashMap::new();
+
+        for account in account_map.values() {
+            if !Self::has_credentials(account) {
+                continue;
+            }
+            let identity = slot_identity(account);
+            let snapshot = snapshot_map.get(&account.id);
+            let weight = snapshot
+                .as_ref()
+                .map(|s| compute_weight(s, now))
+                .unwrap_or(1.0)
+                .max(0.0);
+            let out_of_tokens = snapshot
+                .as_ref()
+                .and_then(|s| s.snapshot.as_ref())
+                .map(|ev| ev.secondary_used_percent >= 100.0)
+                .unwrap_or(false);
+            let (reset, detected_override_kind) = snapshot
+                .map(Self::slot_reset_metadata)
+                .unwrap_or((None, None));
+            let override_kind = if out_of_tokens && reset.is_some() {
+                detected_override_kind
+            } else {
+                None
+            };
+            total_weight += weight;
+
+            *identity_counts.entry(identity.clone()).or_insert(0) += 1;
+
+            slots.push(SlotChanceInput {
+                account_id: account.id.clone(),
+                label: account_display_label(account),
+                weight,
+                identity,
+                out_of_tokens,
+                reset,
+                override_kind,
+            });
+        }
+
+        let mut accounts: HashMap<String, AccountChance> = HashMap::new();
+
+        for slot in &slots {
+            let pct = if total_weight > 0.0 {
+                (slot.weight / total_weight) * 100.0
+            } else {
+                0.0
+            };
+
+            let pct = if slot.out_of_tokens { 0.0 } else { pct };
+
+            let entry = accounts
+                .entry(slot.account_id.clone())
+                .or_insert_with(|| AccountChance {
+                    account_percentage: 0.0,
+                    slot_count: 0,
+                    slots: Vec::new(),
+                    duplicate_notice: None,
+                    out_of_tokens: slot.out_of_tokens,
+                    out_of_tokens_reset: slot.reset,
+                    override_kind: slot.override_kind,
+                });
+
+            entry.account_percentage += pct;
+            entry.slot_count += 1;
+            entry.slots.push(SlotChance {
+                label: slot.label.clone(),
+                percentage: pct,
+                reset: slot.reset,
+                override_kind: slot.override_kind,
+            });
+            entry.out_of_tokens = entry.out_of_tokens || slot.out_of_tokens;
+            entry.out_of_tokens_reset = entry.out_of_tokens_reset.or(slot.reset);
+            if let Some(kind) = slot.override_kind {
+                entry.override_kind = match (entry.override_kind, kind) {
+                    (Some(LimitOverrideKind::Hourly), _) => Some(LimitOverrideKind::Hourly),
+                    (_, LimitOverrideKind::Hourly) => Some(LimitOverrideKind::Hourly),
+                    (Some(existing), _) => Some(existing),
+                    (None, incoming) => Some(incoming),
+                };
+            }
+        }
+
+        // Flag duplicates only when multiple accounts share the same slot identity.
+        for slot in &slots {
+            if let Some(count) = identity_counts.get(&slot.identity) {
+                if *count > 1 {
+                    if let Some(acc) = accounts.get_mut(&slot.account_id) {
+                        acc.duplicate_notice = Some(format!(
+                            " Duplicate slot identity detected ({} accounts share {})",
+                            count, slot.identity
+                        ));
+                    }
+                }
+            }
+        }
+
+        for acc in accounts.values_mut() {
+            acc.slots.sort_by(|a, b| b.percentage.partial_cmp(&a.percentage).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        SelectionChanceSummary { accounts }
+    }
+
+    fn selection_account_summary_line(
+        label: Option<&str>,
+        chance: &AccountChance,
+    ) -> Line<'static> {
+        let slots_label = if chance.slot_count == 1 { "slot" } else { "slots" };
+        let pct = chance.account_percentage.clamp(0.0, 100.0);
+        let base = match label {
+            Some(name) => format!(
+                "Selection chance: {:.0}% ({} {slots_label}) - {name}",
+                pct, chance.slot_count
+            ),
+            None => format!(
+                "Selection chance: {:.0}% ({} {slots_label})",
+                pct, chance.slot_count
+            ),
+        };
+        base.into()
+    }
+
+    fn selection_slot_line(label: &str, pct_global: f64, account_pct: f64) -> Line<'static> {
+        let overall = pct_global.clamp(0.0, 100.0);
+        let relative = if account_pct > 0.0 {
+            (pct_global / account_pct).clamp(0.0, 1.0) * 100.0
+        } else {
+            0.0
+        };
+        let text = format!(
+            " • {label}: {:.0}% of account ({:.0}% overall)",
+            relative.round(),
+            overall.round()
+        );
+        text.dim().into()
+    }
+
+    fn selection_override_line(
+        label: &str,
+        kind: LimitOverrideKind,
+        reset: Option<DateTime<Utc>>,
+    ) -> Line<'static> {
+        let scope = match kind {
+            LimitOverrideKind::Weekly => "weekly",
+            LimitOverrideKind::Hourly => "hourly",
+        };
+        let when = reset
+            .map(|r| r.to_rfc3339())
+            .unwrap_or_else(|| "soon".to_string());
+        let text = format!(
+            "   ↳ overriding {scope} limit to 100% until {when} for {label}",
+            label = label
+        );
+        text.dim().into()
+    }
+
+    fn out_of_tokens_line(
+        kind: Option<LimitOverrideKind>,
+        reset: Option<DateTime<Utc>>,
+    ) -> Option<Line<'static>> {
+        let scope = match kind.unwrap_or(LimitOverrideKind::Weekly) {
+            LimitOverrideKind::Hourly => "hourly",
+            LimitOverrideKind::Weekly => "weekly",
+        };
+        let suffix = reset
+            .map(|r| format!(" · resets at {}", r.to_rfc3339()))
+            .unwrap_or_else(String::new);
+        Some(Self::dim_line(&format!(" Out of {scope} tokens{suffix}")))
+    }
+
+    fn aggregate_out_of_tokens_summary(summary: &SelectionChanceSummary) -> Option<String> {
+        let mut hourly = false;
+        let mut weekly = false;
+        for chance in summary.accounts.values() {
+            if !chance.out_of_tokens {
+                continue;
+            }
+            match chance.override_kind {
+                Some(LimitOverrideKind::Hourly) => hourly = true,
+                _ => weekly = true,
+            }
+        }
+
+        match (hourly, weekly) {
+            (false, false) => None,
+            (true, true) => Some("Hourly & weekly limits exhausted".to_string()),
+            (true, false) => Some("Hourly limit exhausted".to_string()),
+            (false, true) => Some("Weekly limit exhausted".to_string()),
+        }
+    }
+
+    fn aggregate_selection_lines(
+        summary: &SelectionChanceSummary,
+        account_map: &HashMap<String, StoredAccount>,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if summary.accounts.is_empty() {
+            lines.push(RtLine::from("Selection chance: unavailable"));
+            lines.push(RtLine::from(" Add rate-limit snapshots or refresh to track usage."));
+            return lines;
+        }
+        lines.push(Self::dim_line(" Selection chance (all accounts):"));
+        let mut accounts: Vec<_> = summary.accounts.iter().collect();
+        accounts.sort_by(|(ida, _), (idb, _)| ida.cmp(idb));
+        for (account_id, chance) in accounts {
+            let label = account_map
+                .get(account_id)
+                .map(account_display_label)
+                .unwrap_or_else(|| account_id.clone());
+            lines.push(Self::selection_account_summary_line(Some(&label), chance));
+            for slot in &chance.slots {
+                lines.push(Self::selection_slot_line(
+                    &slot.label,
+                    slot.percentage,
+                    chance.account_percentage,
+                ));
+                if let Some(kind) = slot.override_kind {
+                    lines.push(Self::selection_override_line(&slot.label, kind, slot.reset));
+                }
+            }
+            if let Some(dup) = &chance.duplicate_notice {
+                lines.push(Self::dim_line(dup));
+            }
+            if chance.out_of_tokens {
+                if let Some(line) = Self::out_of_tokens_line(chance.override_kind, chance.out_of_tokens_reset) {
+                    lines.push(line);
+                }
+            }
+            lines.push("".into());
+        }
+        lines
+    }
+
+    fn apply_out_of_tokens_usage_override(
+        snapshot: &mut RateLimitSnapshotEvent,
+        chance: &AccountChance,
+    ) {
+        if !chance.out_of_tokens {
+            return;
+        }
+        let Some(kind) = chance.override_kind else {
+            return;
+        };
+        let Some(reset) = chance.out_of_tokens_reset else {
+            return;
+        };
+        if reset <= Utc::now() {
+            return;
+        }
+
+        match kind {
+            LimitOverrideKind::Weekly => {
+                if snapshot.secondary_used_percent < 100.0 {
+                    snapshot.secondary_used_percent = 100.0;
+                }
+            }
+            LimitOverrideKind::Hourly => {
+                if snapshot.primary_used_percent < 100.0 {
+                    snapshot.primary_used_percent = 100.0;
+                }
+            }
+        }
+    }
+
+    fn has_credentials(account: &StoredAccount) -> bool {
+        match account.mode {
+            AuthMode::ApiKey => account.openai_api_key.is_some(),
+            AuthMode::ChatGPT => account.tokens.is_some(),
+        }
     }
 
     fn build_limits_tabs(
@@ -6693,9 +7067,24 @@ impl ChatWidget<'_> {
         let usage_records = account_usage::list_rate_limit_snapshots(&code_home).unwrap_or_default();
         let mut snapshot_map: HashMap<String, StoredRateLimitSnapshot> = usage_records
             .into_iter()
-            .filter(|record| account_map.contains_key(&record.account_id))
             .map(|record| (record.account_id.clone(), record))
             .collect();
+
+        // Include the current live snapshot so chances reflect the latest pull.
+        if let Some(s) = current_snapshot.clone() {
+            let key = s.account_id.clone().unwrap_or_default();
+            snapshot_map.entry(key).or_insert(StoredRateLimitSnapshot {
+                account_id: s.account_id.clone().unwrap_or_default(),
+                plan: None,
+                snapshot: Some(s),
+                observed_at: None,
+                primary_next_reset_at: None,
+                secondary_next_reset_at: None,
+                last_usage_limit_hit_at: None,
+            });
+        }
+
+        let selection_chances = Self::compute_selection_chances(&account_map, &snapshot_map);
 
         let mut usage_summary_map: HashMap<String, StoredUsageSummary> = HashMap::new();
         for id in account_map.keys() {
@@ -6715,47 +7104,54 @@ impl ChatWidget<'_> {
         let mut tabs: Vec<LimitsTab> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
 
-        if let Some(snapshot) = current_snapshot {
-            let account_ref = active_id
-                .as_ref()
-                .and_then(|id| account_map.get(id));
-            let snapshot_ref = active_id
-                .as_ref()
-                .and_then(|id| snapshot_map.get(id));
-            let summary_ref = active_id
-                .as_ref()
-                .and_then(|id| usage_summary_map.get(id));
+        let mut aggregate_inserted = false;
+        if let Ok(Some(record)) = load_aggregate_rate_limit_snapshot(&code_home) {
+            snapshot_map.insert(record.account_id.clone(), record);
+        }
 
-            let title = account_ref
-                .map(account_display_label)
-                .or_else(|| active_id.clone())
-                .unwrap_or_else(|| "Current session".to_string());
-            let header = Self::account_header_lines(
-                account_ref,
-                snapshot_ref,
-                summary_ref,
-                active_id.as_deref(),
-            );
-            let is_api_key_account = matches!(
-                account_ref.map(|acc| acc.mode),
-                Some(McpAuthMode::ApiKey)
-            );
-            let extra = Self::usage_history_lines(summary_ref, is_api_key_account);
-            let display = Self::rate_limit_display_config_for_account(account_ref);
-            let view = build_limits_view(
-                &snapshot,
-                current_reset,
-                DEFAULT_GRID_CONFIG,
-                display,
-            );
-            tabs.push(LimitsTab::view(title, header, view, extra));
+        if let Some(record) = snapshot_map.remove(AGGREGATE_ACCOUNT_ID) {
+            tabs.push(self.build_aggregate_limits_tab(record, &account_map, &usage_summary_map, &selection_chances));
+            seen_ids.insert(AGGREGATE_ACCOUNT_ID.to_string());
+            aggregate_inserted = true;
+        }
 
-            if let Some(active_id) = active_id.as_ref() {
-                if account_map.contains_key(active_id) {
-                    seen_ids.insert(active_id.clone());
-                    snapshot_map.remove(active_id);
-                    usage_summary_map.remove(active_id);
+        let mut live_snapshot = current_snapshot;
+        let main_account_id = Self::resolve_main_account_id(active_id.clone(), &account_map);
+        if let Some(main_id) = main_account_id.clone() {
+            if let Some(tab) = self.build_account_limits_tab(
+                &main_id,
+                &mut live_snapshot,
+                current_reset.clone(),
+                &account_map,
+                &mut snapshot_map,
+                &mut usage_summary_map,
+                &selection_chances,
+            ) {
+                seen_ids.insert(main_id);
+                tabs.push(tab);
+            }
+        }
+
+        if let Some(target_id) = live_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.account_id.clone())
+            .or_else(|| active_id.clone())
+        {
+            if !seen_ids.contains(&target_id) {
+                if let Some(tab) = self.build_account_limits_tab(
+                    &target_id,
+                    &mut live_snapshot,
+                    current_reset.clone(),
+                    &account_map,
+                    &mut snapshot_map,
+                    &mut usage_summary_map,
+                    &selection_chances,
+                ) {
+                    seen_ids.insert(target_id);
+                    tabs.push(tab);
                 }
+            } else {
+                live_snapshot.take();
             }
         }
 
@@ -6789,85 +7185,23 @@ impl ChatWidget<'_> {
         });
 
         for id in remaining_ids {
-            let account = account_map.get(&id);
-            let record = snapshot_map.remove(&id);
-            let usage_summary = usage_summary_map.remove(&id);
-            let title = account
-                .map(account_display_label)
-                .unwrap_or_else(|| id.clone());
-            match record {
-                Some(record) => {
-                    if let Some(snapshot) = record.snapshot.clone() {
-                        let view_snapshot = snapshot.clone();
-                        let view_reset = RateLimitResetInfo {
-                            primary_next_reset: record.primary_next_reset_at,
-                            secondary_next_reset: record.secondary_next_reset_at,
-                            ..RateLimitResetInfo::default()
-                        };
-                        let display = Self::rate_limit_display_config_for_account(account);
-                        let view = build_limits_view(
-                            &view_snapshot,
-                            view_reset,
-                            DEFAULT_GRID_CONFIG,
-                            display,
-                        );
-                        let header = Self::account_header_lines(
-                            account,
-                            Some(&record),
-                            usage_summary.as_ref(),
-                            Some(id.as_str()),
-                        );
-                        let is_api_key_account = matches!(
-                            account.map(|acc| acc.mode),
-                            Some(McpAuthMode::ApiKey)
-                        );
-                        let extra = Self::usage_history_lines(
-                            usage_summary.as_ref(),
-                            is_api_key_account,
-                        );
-                        tabs.push(LimitsTab::view(title, header, view, extra));
-                    } else {
-                        let is_api_key_account = matches!(
-                            account.map(|acc| acc.mode),
-                            Some(McpAuthMode::ApiKey)
-                        );
-                        let mut lines = Self::usage_history_lines(
-                            usage_summary.as_ref(),
-                            is_api_key_account,
-                        );
-                        lines.push(Self::dim_line(
-                            " Rate limit snapshot not yet available.",
-                        ));
-                        let header = Self::account_header_lines(
-                            account,
-                            Some(&record),
-                            usage_summary.as_ref(),
-                            Some(id.as_str()),
-                        );
-                        tabs.push(LimitsTab::message(title, header, lines));
-                    }
-                }
-                None => {
-                    let is_api_key_account = matches!(
-                        account.map(|acc| acc.mode),
-                        Some(McpAuthMode::ApiKey)
-                    );
-                    let mut lines = Self::usage_history_lines(
-                        usage_summary.as_ref(),
-                        is_api_key_account,
-                    );
-                    lines.push(Self::dim_line(
-                        " Rate limit snapshot not yet available.",
-                    ));
-                    let header = Self::account_header_lines(
-                        account,
-                        None,
-                        usage_summary.as_ref(),
-                        Some(id.as_str()),
-                    );
-                    tabs.push(LimitsTab::message(title, header, lines));
-                }
+            if let Some(tab) = self.build_account_limits_tab(
+                &id,
+                &mut live_snapshot,
+                current_reset.clone(),
+                &account_map,
+                &mut snapshot_map,
+                &mut usage_summary_map,
+                &selection_chances,
+            ) {
+                tabs.push(tab);
             }
+        }
+
+        if !aggregate_inserted {
+            let tab = self
+                .aggregate_usage_tab_with_selection(&account_map, &usage_summary_map, &selection_chances);
+            tabs.insert(0, tab);
         }
 
         if tabs.is_empty() {
@@ -6995,6 +7329,18 @@ impl ChatWidget<'_> {
             lines.push(RtLine::from(vec![
                 RtSpan::raw(status_field_prefix("Account")),
                 RtSpan::styled(display, value_style),
+            ]));
+        }
+
+        if let Some(email) = account
+            .and_then(|acc| acc.tokens.as_ref())
+            .and_then(|tokens| tokens.id_token.email.clone())
+            .map(|email| email.trim().to_string())
+            .filter(|email| !email.is_empty())
+        {
+            lines.push(RtLine::from(vec![
+                RtSpan::raw(status_field_prefix("Email")),
+                RtSpan::styled(email, value_style),
             ]));
         }
 
@@ -7452,6 +7798,390 @@ impl ChatWidget<'_> {
             }
         }
         totals
+    }
+
+    fn aggregate_usage_tab_with_selection(
+        &self,
+        account_map: &HashMap<String, StoredAccount>,
+        usage_summary_map: &HashMap<String, StoredUsageSummary>,
+        selection_chances: &SelectionChanceSummary,
+    ) -> LimitsTab {
+        let mut lines = Self::aggregate_usage_lines(account_map, usage_summary_map)
+            .unwrap_or_else(|| vec![Self::dim_line(" No usage recorded yet.")]);
+        let before = lines.len();
+        lines.extend(Self::aggregate_selection_lines(selection_chances, account_map));
+        if lines.len() == before {
+            lines.push(RtLine::from("Selection chance: unavailable"));
+        }
+
+        if !account_map.is_empty() {
+            let mut slot_labels: Vec<String> = account_map.values().map(account_display_label).collect();
+            slot_labels.sort();
+            let summary = format!("Slots: {}", slot_labels.join(", "));
+            lines.insert(0, RtLine::from(summary));
+        }
+
+        let header = vec![Self::dim_line(" Aggregate usage across all linked accounts.")];
+        LimitsTab::message("Aggregate", header, lines)
+    }
+
+    fn aggregate_usage_lines(
+        account_map: &HashMap<String, StoredAccount>,
+        usage_summary_map: &HashMap<String, StoredUsageSummary>,
+    ) -> Option<Vec<RtLine<'static>>> {
+        if usage_summary_map.is_empty() {
+            return None;
+        }
+
+        let mut totals = TokenTotals::default();
+        let mut last_updated = None;
+        for summary in usage_summary_map.values() {
+            Self::accumulate_token_totals(&mut totals, &summary.totals);
+            last_updated = match last_updated {
+                Some(current) if current > summary.last_updated => Some(current),
+                _ => Some(summary.last_updated),
+            };
+        }
+
+        let mut account_labels: Vec<String> = usage_summary_map
+            .keys()
+            .filter_map(|id| account_map.get(id))
+            .map(|account| account_display_label(account))
+            .collect();
+        account_labels.sort();
+
+        let value_style = Style::default().fg(crate::colors::text_dim());
+        let mut lines = Vec::new();
+        lines.push(RtLine::from(vec![RtSpan::styled(
+            "Aggregate limits",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]));
+
+        if !account_labels.is_empty() {
+            lines.push(RtLine::from(vec![
+                RtSpan::raw(status_field_prefix("Accounts")),
+                RtSpan::styled(account_labels.join(", "), value_style),
+            ]));
+        }
+
+        let non_cached_input = totals.input_tokens.saturating_sub(totals.cached_input_tokens);
+        let formatted_total = format_with_separators(totals.total_tokens);
+        let formatted_cost = Self::format_usd(Self::usage_cost_usd_from_totals(&totals));
+        lines.push(RtLine::from(vec![
+            RtSpan::raw(status_field_prefix("Tokens")),
+            RtSpan::styled(
+                format!("{formatted_total} total ({formatted_cost})"),
+                value_style,
+            ),
+        ]));
+
+        let indent = status_content_prefix();
+        let counts = [
+            (format_with_separators(totals.cached_input_tokens), "cached"),
+            (format_with_separators(non_cached_input), "input"),
+            (format_with_separators(totals.output_tokens), "output"),
+            (
+                format_with_separators(totals.reasoning_output_tokens),
+                "reasoning",
+            ),
+        ];
+        let max_width = counts
+            .iter()
+            .map(|(count, _)| count.len())
+            .max()
+            .unwrap_or(0);
+        for (count, label) in counts.iter() {
+            let number = format!("{count:>width$}", count = count, width = max_width);
+            lines.push(RtLine::from(vec![
+                RtSpan::raw(indent.clone()),
+                RtSpan::styled(number, value_style),
+                RtSpan::styled(format!(" {label}"), value_style),
+            ]));
+        }
+
+        if let Some(updated) = last_updated {
+            let elapsed = Utc::now() - updated;
+            let elapsed_display = format_duration(elapsed.to_std().unwrap_or_default());
+            let timestamp =
+                updated.with_timezone(&Local).format("%b %-d, %Y %-I:%M %p").to_string();
+            lines.push(RtLine::from(vec![
+                RtSpan::raw(status_field_prefix("Updated")),
+                RtSpan::styled(
+                    format!("{timestamp} ({elapsed_display} ago)"),
+                    value_style,
+                ),
+            ]));
+        }
+
+        Some(lines)
+    }
+
+    fn append_selection_hint_to_plan_line(
+        lines: &mut [RtLine<'static>],
+        hint: &str,
+    ) {
+        for line in lines.iter_mut() {
+            if let Some(first) = line.spans.first() {
+                if first.content.starts_with(&status_field_prefix("Plan")) {
+                    let style = line
+                        .spans
+                        .get(1)
+                        .map(|s| s.style)
+                        .unwrap_or_default();
+                    let mut spans = line.spans.clone();
+                    spans.push(RtSpan::raw(" · "));
+                    spans.push(RtSpan::styled(hint.to_string(), style));
+                    line.spans = spans;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn append_slot_summary_to_account_line(
+        lines: &mut [RtLine<'static>],
+        summary: Option<&str>,
+    ) {
+        let Some(summary_text) = summary else { return };
+        for line in lines.iter_mut() {
+            if let Some(first) = line.spans.first() {
+                if first.content.starts_with(&status_field_prefix("Account")) {
+                    let style = line
+                        .spans
+                        .get(1)
+                        .map(|s| s.style)
+                        .unwrap_or_default();
+                    let mut spans = line.spans.clone();
+                    spans.push(RtSpan::raw(" · "));
+                    spans.push(RtSpan::styled(summary_text.to_string(), style));
+                    line.spans = spans;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn build_aggregate_limits_tab(
+        &self,
+        record: StoredRateLimitSnapshot,
+        account_map: &HashMap<String, StoredAccount>,
+        usage_summary_map: &HashMap<String, StoredUsageSummary>,
+        selection_chances: &SelectionChanceSummary,
+    ) -> LimitsTab {
+        if let Some(snapshot) = record.snapshot.clone() {
+            let mut reset_info = RateLimitResetInfo::default();
+            reset_info.primary_next_reset = record.primary_next_reset_at;
+            reset_info.secondary_next_reset = record.secondary_next_reset_at;
+            let view = build_limits_view(
+                &snapshot,
+                reset_info,
+                DEFAULT_GRID_CONFIG,
+                DEFAULT_DISPLAY_CONFIG,
+            );
+            let mut header = vec![RtLine::from(vec![RtSpan::styled(
+                "Aggregate limits",
+                Style::default().add_modifier(Modifier::BOLD),
+            )])];
+
+            let mut acct_header = Self::account_header_lines(
+                None,
+                Some(&record),
+                None,
+                Some("Aggregate"),
+            );
+
+            let selection_hint = if selection_chances.accounts.is_empty() {
+                "Selection chance: unavailable".to_string()
+            } else {
+                let slots: usize = selection_chances.accounts.values().map(|c| c.slot_count).sum();
+                let accounts = selection_chances.accounts.len();
+                format!("Selection chance: tracked across {slots} slots ({accounts} account{})",
+                    if accounts == 1 { "" } else { "s" })
+            };
+
+            let mut summary_parts: Vec<String> = Vec::new();
+            if !account_map.is_empty() {
+                let mut labels: Vec<String> = account_map.values().map(account_display_label).collect();
+                labels.sort();
+                summary_parts.push(format!("Slots: {}", labels.join(", ")));
+            }
+
+            if let Some(duplicate) = selection_chances
+                .accounts
+                .values()
+                .find_map(|c| c.duplicate_notice.as_deref())
+            {
+                summary_parts.push(duplicate.trim_start().to_string());
+            }
+
+            if let Some(status) = Self::aggregate_out_of_tokens_summary(selection_chances) {
+                summary_parts.push(status);
+            }
+
+            let slot_summary = if summary_parts.is_empty() {
+                None
+            } else {
+                Some(summary_parts.join(" · "))
+            };
+
+            Self::append_selection_hint_to_plan_line(&mut acct_header, &selection_hint);
+            Self::append_slot_summary_to_account_line(&mut acct_header, slot_summary.as_deref());
+
+            if let Some(dup) = selection_chances
+                .accounts
+                .values()
+                .find_map(|c| c.duplicate_notice.as_deref())
+            {
+                header.push(Self::dim_line(dup));
+            } else {
+                let slot_count = account_map
+                    .values()
+                    .filter(|a| a.id.starts_with("slot-"))
+                    .count();
+                if slot_count > 1 {
+                    header.push(Self::dim_line(&format!(
+                        " Duplicate slot configuration detected ({} slots)",
+                        slot_count
+                    )));
+                }
+            }
+
+            header.extend(acct_header);
+            let mut extra = Self::aggregate_usage_lines(account_map, usage_summary_map).unwrap_or_default();
+            extra.extend(Self::aggregate_selection_lines(selection_chances, account_map));
+            LimitsTab::view(
+                "Aggregate",
+                header,
+                view,
+                extra,
+            )
+        } else {
+            self.aggregate_usage_tab_with_selection(account_map, usage_summary_map, selection_chances)
+        }
+    }
+
+    fn resolve_main_account_id(
+        active_id: Option<String>,
+        account_map: &HashMap<String, StoredAccount>,
+    ) -> Option<String> {
+        if let Some(id) = active_id {
+            if !is_slot_account_id(&id) {
+                return Some(id);
+            }
+        }
+        account_map
+            .keys()
+            .find(|id| !is_slot_account_id(id))
+            .cloned()
+    }
+
+    fn snapshot_matches_account(snapshot: &RateLimitSnapshotEvent, account_id: &str) -> bool {
+        match snapshot.account_id.as_deref() {
+            Some(id) => id == account_id,
+            None => !is_slot_account_id(account_id),
+        }
+    }
+
+    fn build_account_limits_tab(
+        &self,
+        account_id: &str,
+        live_snapshot: &mut Option<RateLimitSnapshotEvent>,
+        current_reset: RateLimitResetInfo,
+        account_map: &HashMap<String, StoredAccount>,
+        snapshot_map: &mut HashMap<String, StoredRateLimitSnapshot>,
+        usage_summary_map: &mut HashMap<String, StoredUsageSummary>,
+        selection_chances: &SelectionChanceSummary,
+    ) -> Option<LimitsTab> {
+        let account = account_map.get(account_id);
+        let record = snapshot_map.remove(account_id);
+        let mut view_snapshot = None;
+        let mut view_reset = current_reset;
+
+        if let Some(snapshot) = live_snapshot.as_ref() {
+            if Self::snapshot_matches_account(snapshot, account_id) {
+                view_snapshot = live_snapshot.take();
+            }
+        }
+
+        if view_snapshot.is_none() {
+            if let Some(stored) = record.as_ref() {
+                if let Some(snapshot) = stored.snapshot.clone() {
+                    view_snapshot = Some(snapshot);
+                    view_reset = RateLimitResetInfo {
+                        primary_next_reset: stored.primary_next_reset_at,
+                        secondary_next_reset: stored.secondary_next_reset_at,
+                        ..RateLimitResetInfo::default()
+                    };
+                }
+            }
+        }
+
+        let usage_summary = usage_summary_map.remove(account_id);
+        let is_api_key_account = matches!(account.map(|acc| acc.mode), Some(McpAuthMode::ApiKey));
+        let mut extra = Self::usage_history_lines(usage_summary.as_ref(), is_api_key_account);
+
+        if let Some(sel) = selection_chances.accounts.get(account_id) {
+            for slot in &sel.slots {
+                extra.push(Self::selection_slot_line(
+                    &slot.label,
+                    slot.percentage,
+                    sel.account_percentage,
+                ));
+                if let Some(kind) = slot.override_kind {
+                    extra.push(Self::selection_override_line(&slot.label, kind, slot.reset));
+                }
+            }
+            if sel.duplicate_notice.is_some() {
+                extra.push(Self::dim_line(sel.duplicate_notice.as_ref().unwrap()));
+            }
+            if sel.out_of_tokens {
+                if let Some(line) = Self::out_of_tokens_line(sel.override_kind, sel.out_of_tokens_reset) {
+                    extra.push(line);
+                }
+            }
+            extra.push("".into());
+        }
+
+        if let (Some(snapshot), Some(sel)) = (view_snapshot.as_mut(), selection_chances.accounts.get(account_id)) {
+            Self::apply_out_of_tokens_usage_override(snapshot, sel);
+        }
+
+        let mut header = Self::account_header_lines(
+            account,
+            record.as_ref(),
+            usage_summary.as_ref(),
+            Some(account_id),
+        );
+
+        // Show a single account-level selection summary in the header only.
+        if let Some(sel) = selection_chances.accounts.get(account_id) {
+            header.push(Self::selection_account_summary_line(
+                account.map(|acc| account_display_label(acc)).as_deref(),
+                sel,
+            ));
+        }
+
+        // Surface selection chance above usage sections.
+        if let Some(sel) = selection_chances.accounts.get(account_id) {
+            if let Some(dup) = sel.duplicate_notice.as_ref() {
+                header.push(Self::dim_line(dup));
+            }
+        }
+        let title = account
+            .map(account_display_label)
+            .unwrap_or_else(|| account_id.to_string());
+
+        if let Some(snapshot) = view_snapshot {
+            let display = Self::rate_limit_display_config_for_account(account);
+            let view = build_limits_view(&snapshot, view_reset, DEFAULT_GRID_CONFIG, display);
+            return Some(LimitsTab::view(title, header, view, extra));
+        }
+
+        if extra.is_empty() {
+            return None;
+        }
+        extra.push(Self::dim_line(" Rate limit snapshot not yet available."));
+        Some(LimitsTab::message(title, header, extra))
     }
 
     fn aggregate_daily_totals(
@@ -8304,7 +9034,7 @@ impl ChatWidget<'_> {
                 Some(Box::new(history_cell::ExploreAggregationCell::from_record(state.clone())))
             }
             HistoryRecord::RateLimits(state) => Some(Box::new(
-                history_cell::RateLimitsCell::from_record(state.clone()),
+                history_cell::RateLimitsCell::from_record(state.clone(), &self.config),
             )),
             HistoryRecord::BackgroundEvent(state) => {
                 Some(Box::new(history_cell::BackgroundEventCell::new(state.clone())))
@@ -10951,8 +11681,7 @@ impl ChatWidget<'_> {
     }
 
     pub(crate) fn handle_mouse_event(&mut self, mouse_event: crossterm::event::MouseEvent) {
-        use crossterm::event::KeyModifiers;
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
         // Check if Shift is held - if so, let the terminal handle selection
         if mouse_event.modifiers.contains(KeyModifiers::SHIFT) {
@@ -10964,6 +11693,16 @@ impl ChatWidget<'_> {
         match mouse_event.kind {
             MouseEventKind::ScrollUp => layout_scroll::mouse_scroll(self, true),
             MouseEventKind::ScrollDown => layout_scroll::mouse_scroll(self, false),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.terminal_cancel_hitbox_contains(mouse_event.column, mouse_event.row)
+                    && self.terminal_is_running()
+                {
+                    if let Some(id) = self.terminal_overlay_id() {
+                        self.request_terminal_cancel(id);
+                    }
+                    return;
+                }
+            }
             _ => {
                 // Ignore other mouse events for now
             }
@@ -11535,7 +12274,8 @@ impl ChatWidget<'_> {
                             account_id: observed_account_id.clone(),
                             account_label,
                         };
-                        let cell = history_cell::RateLimitsCell::from_record(record.clone());
+                        let cell =
+                            history_cell::RateLimitsCell::from_record(record.clone(), &self.config);
                         let key = self.next_internal_key();
                         let _ = self.history_insert_with_key_global_tagged(
                             Box::new(cell),
@@ -13237,24 +13977,56 @@ impl ChatWidget<'_> {
         self.ensure_settings_overlay_section(SettingsSection::Limits);
 
         if let Some(cached) = self.limits.cached_content.take() {
-            self.update_limits_settings_content(cached);
+            self.update_limits_settings_content_with_preference(cached, None);
         }
 
         let snapshot = self.rate_limit_snapshot.clone();
         let needs_refresh = self.should_refresh_limits();
+        let reset_info = self.rate_limit_reset_info();
+        let tabs = self.build_limits_tabs(snapshot.clone(), reset_info.clone());
+        let has_tabs = !tabs.is_empty();
 
-        if self.rate_limit_fetch_inflight || needs_refresh {
-            self.set_limits_overlay_content(LimitsOverlayContent::Loading);
-        } else {
-            let reset_info = self.rate_limit_reset_info();
-            let tabs = self.build_limits_tabs(snapshot.clone(), reset_info);
+        if has_tabs {
             self.set_limits_overlay_tabs(tabs);
+        } else if self.rate_limit_fetch_inflight || needs_refresh {
+            self.set_limits_overlay_content(LimitsOverlayContent::Loading, None);
+        } else {
+            // No tabs yet; build an eager Aggregate tab with selection chances so the first frame
+            // is populated.
+            let account_map: HashMap<String, StoredAccount> = auth_accounts
+                ::list_accounts(&self.config.code_home)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| (a.id.clone(), a))
+                .collect();
+
+            let snapshot_map: HashMap<String, StoredRateLimitSnapshot> = account_usage
+                ::list_rate_limit_snapshots(&self.config.code_home)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.account_id.clone(), s))
+                .collect();
+
+            let selection_chances = Self::compute_selection_chances(&account_map, &snapshot_map);
+            #[cfg(test)]
+            println!("selection accounts: {}", selection_chances.accounts.len());
+
+            let mut eager_tabs = self.build_limits_tabs(None, reset_info);
+            if eager_tabs.is_empty() {
+                eager_tabs.push(self.aggregate_usage_tab_with_selection(
+                    &account_map,
+                    &HashMap::new(),
+                    &selection_chances,
+                ));
+            }
+
+            self.set_limits_overlay_tabs(eager_tabs);
         }
 
         self.request_redraw();
 
         if needs_refresh {
-            self.request_latest_rate_limits(snapshot.is_none());
+            self.request_latest_rate_limits(!has_tabs && snapshot.is_none());
         }
     }
 
@@ -13264,7 +14036,7 @@ impl ChatWidget<'_> {
         }
 
         if show_loading {
-            self.set_limits_overlay_content(LimitsOverlayContent::Loading);
+            self.set_limits_overlay_content(LimitsOverlayContent::Loading, None);
             self.request_redraw();
         }
 
@@ -13297,18 +14069,61 @@ impl ChatWidget<'_> {
 
     pub(crate) fn on_rate_limit_refresh_failed(&mut self, message: String) {
         self.rate_limit_fetch_inflight = false;
+        let has_visible_tabs = matches!(
+            self.limits.cached_content.as_ref(),
+            Some(LimitsOverlayContent::Tabs(_))
+        );
+
+        if has_visible_tabs {
+            self.history_push_plain_state(history_cell::new_warning_event(message));
+            self.request_redraw();
+            return;
+        }
 
         let content = if self.rate_limit_snapshot.is_some() {
             LimitsOverlayContent::Error(message.clone())
         } else {
             LimitsOverlayContent::Placeholder
         };
-        self.set_limits_overlay_content(content);
+        self.set_limits_overlay_content(content, None);
         self.request_redraw();
 
         if self.rate_limit_snapshot.is_some() {
             self.history_push_plain_state(history_cell::new_warning_event(message));
         }
+    }
+
+    pub(crate) fn on_request_global_usage_summary(&mut self) {
+        if matches!(self.global_usage.status, GlobalUsageStatus::Processing) {
+            return;
+        }
+
+        self.global_usage.status = GlobalUsageStatus::Processing;
+        self.global_usage.summary = None;
+        self.global_usage.last_error = None;
+        self.update_global_usage_overlay_state();
+        self.refresh_settings_overview_rows();
+        self.request_redraw();
+
+        start_global_usage_refresh(self.app_event_tx.clone(), self.config.code_home.clone());
+    }
+
+    pub(crate) fn on_global_usage_summary_ready(&mut self, summary: String) {
+        self.global_usage.status = GlobalUsageStatus::Ready;
+        self.global_usage.summary = Some(summary);
+        self.global_usage.last_error = None;
+        self.update_global_usage_overlay_state();
+        self.refresh_settings_overview_rows();
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_global_usage_summary_failed(&mut self, message: String) {
+        self.global_usage.status = GlobalUsageStatus::Error;
+        self.global_usage.last_error = Some(message.clone());
+        self.update_global_usage_overlay_state();
+        self.refresh_settings_overview_rows();
+        self.history_push_plain_state(history_cell::new_warning_event(message));
+        self.request_redraw();
     }
 
     fn rate_limit_reset_info(&self) -> RateLimitResetInfo {
@@ -13332,6 +14147,52 @@ impl ChatWidget<'_> {
             overflow_auto_compact: true,
             context_window,
             context_tokens_used,
+        }
+    }
+
+    fn prime_cached_rate_limits(&mut self) {
+        if self.rate_limit_snapshot.is_some() {
+            return;
+        }
+
+        let Ok(records) = account_usage::list_rate_limit_snapshots(&self.config.code_home) else {
+            return;
+        };
+        if records.is_empty() {
+            return;
+        }
+
+        let active_account =
+            auth_accounts::get_active_account_id(&self.config.code_home).ok().flatten();
+        let target_account = active_account
+            .as_ref()
+            .filter(|id| !is_slot_account_id(id))
+            .cloned()
+            .or_else(|| {
+                records
+                    .iter()
+                    .find(|record| !is_slot_account_id(&record.account_id))
+                    .map(|record| record.account_id.clone())
+            })
+            .or_else(|| records.get(0).map(|record| record.account_id.clone()));
+
+        let Some(target_id) = target_account else {
+            return;
+        };
+
+        let Some(record) = records.into_iter().find(|record| record.account_id == target_id) else {
+            return;
+        };
+
+        if let Some(snapshot) = record.snapshot.clone() {
+            self.rate_limit_snapshot = Some(snapshot);
+            self.last_rate_limit_account_id = Some(target_id);
+            if self.rate_limit_primary_next_reset_at.is_none() {
+                self.rate_limit_primary_next_reset_at = record.primary_next_reset_at;
+            }
+            if self.rate_limit_secondary_next_reset_at.is_none() {
+                self.rate_limit_secondary_next_reset_at = record.secondary_next_reset_at;
+            }
         }
     }
 
@@ -17728,6 +18589,20 @@ Have we met every part of this goal and is there no further work to do?"#
         self.terminal.overlay().is_some()
     }
 
+    fn terminal_cancel_hitbox_contains(&self, column: u16, row: u16) -> bool {
+        if let Some(rect) = self.terminal.cancel_hitbox() {
+            if rect.width == 0 || rect.height == 0 {
+                return false;
+            }
+            column >= rect.x
+                && column < rect.x.saturating_add(rect.width)
+                && row >= rect.y
+                && row < rect.y.saturating_add(rect.height)
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn terminal_is_running(&self) -> bool {
         self.terminal.overlay().map(|o| o.running).unwrap_or(false)
     }
@@ -19297,6 +20172,7 @@ Have we met every part of this goal and is there no further work to do?"#
         overlay.set_github_content(self.build_github_settings_content());
         overlay.set_limits_content(self.build_limits_settings_content());
         overlay.set_chrome_content(self.build_chrome_settings_content(None));
+        overlay.set_global_usage_content(self.build_global_usage_settings_content());
         let overview_rows = self.build_settings_overview_rows();
         overlay.set_overview_rows(overview_rows);
 
@@ -19386,6 +20262,10 @@ Have we met every part of this goal and is there no further work to do?"#
 
     fn build_chrome_settings_content(&self, port: Option<u16>) -> ChromeSettingsContent {
         ChromeSettingsContent::new(self.app_event_tx.clone(), port)
+    }
+
+    fn build_global_usage_settings_content(&self) -> GlobalUsageSettingsContent {
+        GlobalUsageSettingsContent::new(self.global_usage.clone(), self.app_event_tx.clone())
     }
 
     fn build_mcp_server_rows(&mut self) -> Option<McpServerRows> {
@@ -19669,6 +20549,7 @@ Have we met every part of this goal and is there no further work to do?"#
                     SettingsSection::Chrome => self.settings_summary_chrome(),
                     SettingsSection::Mcp => self.settings_summary_mcp(),
                     SettingsSection::Notifications => self.settings_summary_notifications(),
+                    SettingsSection::GlobalUsage => self.settings_summary_global_usage(),
                 };
                 SettingsOverviewRow::new(section, summary)
             })
@@ -19844,6 +20725,22 @@ Have we met every part of this goal and is there no further work to do?"#
         }
     }
 
+    fn settings_summary_global_usage(&self) -> Option<String> {
+        match self.global_usage.status {
+            GlobalUsageStatus::Processing => Some("Global usage: processing…".to_string()),
+            GlobalUsageStatus::Ready => self
+                .global_usage
+                .summary
+                .as_ref()
+                .map(|s| format!("Global usage: {}", s)),
+            GlobalUsageStatus::Error => self.global_usage.last_error.as_ref().map(|msg| {
+                let trimmed = msg.split('\n').next().unwrap_or(msg);
+                format!("Global usage: error ({trimmed})")
+            }),
+            GlobalUsageStatus::Idle => Some("Global usage: press Enter to compute".to_string()),
+        }
+    }
+
     fn refresh_settings_overview_rows(&mut self) {
         if self.settings.overlay.is_none() {
             return;
@@ -19853,6 +20750,14 @@ Have we met every part of this goal and is there no further work to do?"#
             overlay.set_overview_rows(rows);
         }
         self.request_redraw();
+    }
+
+    fn update_global_usage_overlay_state(&mut self) {
+        if let Some(overlay) = self.settings.overlay.as_mut() {
+            if let Some(content) = overlay.global_usage_content_mut() {
+                content.update_state(self.global_usage.clone());
+            }
+        }
     }
 
     fn format_reasoning_effort(effort: ReasoningEffort) -> &'static str {
@@ -19952,7 +20857,8 @@ Have we met every part of this goal and is there no further work to do?"#
             | SettingsSection::Github
             | SettingsSection::AutoDrive
             | SettingsSection::Mcp
-            | SettingsSection::Notifications => false,
+            | SettingsSection::Notifications
+            | SettingsSection::GlobalUsage => false,
             SettingsSection::Agents => {
                 self.show_agents_overview_ui();
                 false
@@ -24338,11 +25244,20 @@ Have we met every part of this goal and is there no further work to do?"#
         };
 
         // Get current working directory string
-        let cwd_str = match relativize_to_home(&self.config.cwd) {
-            Some(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
-            Some(_) => "~".to_string(),
-            None => self.config.cwd.display().to_string(),
+        let (cwd_str, cwd_is_home) = match relativize_to_home(&self.config.cwd) {
+            Some(rel) if !rel.as_os_str().is_empty() => (format!("~/{}", rel.display()), false),
+            Some(_) => ("~".to_string(), true),
+            None => (self.config.cwd.display().to_string(), false),
         };
+
+        let auto_model_override = self
+            .config
+            .auto_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| !self.config.model.eq_ignore_ascii_case(value))
+            .map(|value| value.to_string());
 
         // Build status line spans with dynamic elision based on width.
         // Removal priority when space is tight:
@@ -24360,9 +25275,9 @@ Have we met every part of this goal and is there no further work to do?"#
             let mut spans: Vec<Span> = Vec::new();
             // Title follows theme text color
             spans.push(Span::styled(
-                "Code",
+                "Lightcode",
                 Style::default()
-                    .fg(crate::colors::text())
+                    .fg(crate::colors::warning())
                     .add_modifier(Modifier::BOLD),
             ));
 
@@ -24379,6 +25294,20 @@ Have we met every part of this goal and is there no further work to do?"#
                     self.format_model_name(&self.config.model),
                     Style::default().fg(crate::colors::info()),
                 ));
+                if let Some(auto_model) = auto_model_override.as_deref() {
+                    spans.push(Span::styled(
+                        " (Auto: ",
+                        Style::default().fg(crate::colors::text_dim()),
+                    ));
+                    spans.push(Span::styled(
+                        self.format_model_name(auto_model),
+                        Style::default().fg(crate::colors::info()),
+                    ));
+                    spans.push(Span::styled(
+                        ")",
+                        Style::default().fg(crate::colors::text_dim()),
+                    ));
+                }
             }
 
             if include_reasoning {
@@ -24401,9 +25330,14 @@ Have we met every part of this goal and is there no further work to do?"#
                     "  •  ",
                     Style::default().fg(crate::colors::text_dim()),
                 ));
+                let directory_label_color = if cwd_is_home {
+                    crate::colors::error()
+                } else {
+                    crate::colors::text_dim()
+                };
                 spans.push(Span::styled(
                     "Directory: ",
-                    Style::default().fg(crate::colors::text_dim()),
+                    Style::default().fg(directory_label_color),
                 ));
                 spans.push(Span::styled(
                     cwd_str.clone(),
@@ -24699,6 +25633,8 @@ mod tests {
         CAPTURE_AUTO_TURN_COMMIT_STUB,
         GIT_DIFF_NAME_ONLY_BETWEEN_STUB,
     };
+    use super::limits_overlay::LimitsTabBody;
+    use crate::account_label::account_display_label;
     use crate::bottom_pane::AutoCoordinatorViewModel;
     use crate::chatwidget::message::UserMessage;
     use crate::chatwidget::smoke_helpers::{enter_test_runtime_guard, ChatWidgetHarness};
@@ -24712,6 +25648,7 @@ mod tests {
         AUTO_RESOLVE_MAX_REVIEW_ATTEMPTS,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use chrono::Utc;
     use code_core::config_types::AutoResolveAttemptLimit;
     use code_core::history::state::{
         AssistantStreamDelta,
@@ -24739,9 +25676,19 @@ mod tests {
         Event,
         EventMsg,
         ExecCommandBeginEvent,
+        RateLimitSnapshotEvent,
         TaskCompleteEvent,
+        TokenUsage,
     };
     use code_core::protocol::AgentInfo as CoreAgentInfo;
+    use code_core::{account_usage, auth_accounts};
+    use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
+    use ratatui::Terminal;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+    use tempfile::{tempdir, TempDir};
 
     #[test]
     fn format_model_name_capitalizes_codex_mini() {
@@ -24821,12 +25768,178 @@ mod tests {
         assert_eq!(config.model, "gpt-5.1");
         assert_eq!(config.model_reasoning_effort, ReasoningEffort::Low);
     }
-    use ratatui::backend::TestBackend;
-    use ratatui::text::Line;
-    use ratatui::Terminal;
-    use std::collections::HashMap;
-    use std::time::{Duration, SystemTime};
-    use std::path::PathBuf;
+
+    #[test]
+    fn cached_limits_overlay_shows_main_and_aggregate_tabs_immediately() {
+        let home = tempdir().expect("tempdir");
+        let account = auth_accounts::upsert_api_key_account(
+            home.path(),
+            "sk-test".to_string(),
+            Some("Main".to_string()),
+            true,
+        )
+        .expect("api key account");
+
+        let mut snapshot = RateLimitSnapshotEvent {
+            primary_used_percent: 47.0,
+            secondary_used_percent: 12.0,
+            primary_to_secondary_ratio_percent: 0.0,
+            primary_window_minutes: 60,
+            secondary_window_minutes: 1_440,
+            primary_reset_after_seconds: Some(3_600),
+            secondary_reset_after_seconds: Some(7_200),
+            account_id: Some(account.id.clone()),
+        };
+        if snapshot.secondary_window_minutes > 0 {
+            snapshot.primary_to_secondary_ratio_percent =
+                (snapshot.primary_window_minutes as f64
+                    / snapshot.secondary_window_minutes as f64
+                    * 100.0)
+                    .clamp(0.0, 100.0);
+        }
+
+        account_usage::record_rate_limit_snapshot(
+            home.path(),
+            &account.id,
+            Some("Pro"),
+            &snapshot,
+            Utc::now(),
+        )
+        .expect("persist snapshot");
+
+        let expected_title = account_display_label(&account);
+
+        let mut harness = ChatWidgetHarness::new();
+        harness.with_chat(|chat| {
+            chat.config.code_home = home.path().to_path_buf();
+            chat.rate_limit_snapshot = None;
+            chat.rate_limit_primary_next_reset_at = None;
+            chat.rate_limit_secondary_next_reset_at = None;
+            chat.prime_cached_rate_limits();
+
+            assert!(
+                chat.rate_limit_snapshot.is_some(),
+                "cached snapshot should be present before the first turn",
+            );
+
+            let tabs =
+                chat.build_limits_tabs(chat.rate_limit_snapshot.clone(), chat.rate_limit_reset_info());
+            assert!(
+                tabs.iter().any(|tab| tab.title == "Aggregate"),
+                "Aggregate tab should be available immediately",
+            );
+            let aggregate_tab = tabs
+                .iter()
+                .find(|tab| tab.title == "Aggregate")
+                .expect("aggregate tab");
+            assert!(
+                matches!(aggregate_tab.body, LimitsTabBody::View(_)),
+                "Aggregate tab should render the aggregate snapshot",
+            );
+
+            let main_tab = tabs
+                .iter()
+                .find(|tab| tab.title == expected_title)
+                .expect("main account tab");
+            assert!(
+                matches!(main_tab.body, LimitsTabBody::View(_)),
+                "Main account tab should render cached snapshot",
+            );
+        });
+    }
+
+    #[test]
+    fn aggregate_tab_prefers_snapshot_and_falls_back_to_usage() {
+        let home = TempDir::new().expect("tempdir");
+        let now = Utc::now();
+
+        auth_accounts::upsert_api_key_account(
+            home.path(),
+            "sk-main".to_string(),
+            Some("Main".to_string()),
+            true,
+        )
+        .expect("main account");
+        auth_accounts::upsert_api_key_account(
+            home.path(),
+            "sk-slot".to_string(),
+            Some("Slot".to_string()),
+            false,
+        )
+        .expect("slot account");
+
+        let base_snapshot = |account_id: &str| RateLimitSnapshotEvent {
+            primary_used_percent: 10.0,
+            secondary_used_percent: 15.0,
+            primary_to_secondary_ratio_percent: 0.0,
+            primary_window_minutes: 60,
+            secondary_window_minutes: 10_080,
+            primary_reset_after_seconds: Some(120),
+            secondary_reset_after_seconds: Some(240),
+            account_id: Some(account_id.to_string()),
+        };
+
+        let usage = |input| TokenUsage {
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: input / 2,
+            reasoning_output_tokens: 0,
+            total_tokens: input + input / 2,
+            tokens_in_context_window: 0,
+        };
+
+        account_usage::record_token_usage(
+            home.path(),
+            "acct-main",
+            Some("Pro"),
+            &usage(1_000),
+            now,
+        )
+        .expect("usage");
+        account_usage::record_token_usage(
+            home.path(),
+            "acct-slot",
+            Some("Pro"),
+            &usage(800),
+            now,
+        )
+        .expect("usage");
+
+        account_usage::record_rate_limit_snapshot(
+            home.path(),
+            "acct-main",
+            Some("Pro"),
+            &base_snapshot("acct-main"),
+            now,
+        )
+        .expect("snapshot main");
+        account_usage::record_rate_limit_snapshot(
+            home.path(),
+            "acct-slot",
+            Some("Pro"),
+            &base_snapshot("acct-slot"),
+            now,
+        )
+        .expect("snapshot slot");
+
+        let mut harness = ChatWidgetHarness::new();
+        harness.with_chat(|chat| {
+            chat.config.code_home = home.path().to_path_buf();
+            let tabs = chat.build_limits_tabs(None, chat.rate_limit_reset_info());
+            assert_eq!(tabs.first().map(|tab| tab.title.as_str()), Some("Aggregate"));
+            assert!(matches!(tabs[0].body, LimitsTabBody::View(_)));
+        });
+
+        let agg_path = home.path().join("usage").join("__aggregate__.json");
+        std::fs::remove_file(&agg_path).expect("remove aggregate snapshot");
+
+        harness.with_chat(|chat| {
+            chat.config.code_home = home.path().to_path_buf();
+            let tabs = chat.build_limits_tabs(None, chat.rate_limit_reset_info());
+            assert_eq!(tabs.first().map(|tab| tab.title.as_str()), Some("Aggregate"));
+            assert!(matches!(tabs[0].body, LimitsTabBody::Lines(_)));
+        });
+    }
 
     use code_core::protocol::{ReviewFinding, ReviewCodeLocation, ReviewLineRange};
 
@@ -31970,6 +33083,7 @@ impl WidgetRef for &ChatWidget<'_> {
                     header_area
                 };
 
+                let mut cancel_hitbox: Option<Rect> = None;
                 if header_height > 0 {
                     fill_rect(buf, header_area, Some(' '), inner_bg);
                     let width_limit = header_area.width as usize;
@@ -32005,6 +33119,32 @@ impl WidgetRef for &ChatWidget<'_> {
                             status_text,
                             Style::default().fg(crate::colors::text_dim()),
                         ));
+
+                        header_spans.push(ratatui::text::Span::raw(" "));
+                        consumed_width = consumed_width.saturating_add(1);
+                        let cancel_label = "[X]";
+                        let cancel_start = header_area
+                            .x
+                            .saturating_add(
+                                consumed_width
+                                    .min(u16::MAX as usize) as u16,
+                            );
+                        let cancel_width = UnicodeWidthStr::width(cancel_label);
+                        let cancel_width_u16 = cancel_width
+                            .min(u16::MAX as usize) as u16;
+                        header_spans.push(ratatui::text::Span::styled(
+                            cancel_label,
+                            Style::default()
+                                .fg(crate::colors::error())
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        cancel_hitbox = Some(Rect {
+                            x: cancel_start,
+                            y: header_area.y,
+                            width: cancel_width_u16,
+                            height: header_area.height,
+                        });
+                        consumed_width = consumed_width.saturating_add(cancel_width);
 
                         let interval = crate::spinner::current_spinner().interval_ms.max(50);
                         self.app_event_tx
@@ -32076,6 +33216,7 @@ impl WidgetRef for &ChatWidget<'_> {
                         .wrap(ratatui::widgets::Wrap { trim: true })
                         .render(header_area, buf);
                 }
+                self.terminal.set_cancel_hitbox(cancel_hitbox);
 
                 let mut body_space = content
                     .height
@@ -32218,6 +33359,9 @@ impl WidgetRef for &ChatWidget<'_> {
                     .alignment(ratatui::layout::Alignment::Left)
                     .render(instructions_area, buf);
             }
+        }
+        else {
+            self.terminal.set_cancel_hitbox(None);
         }
 
         if self.terminal.overlay().is_none() && self.browser_overlay_visible {
@@ -32952,6 +34096,32 @@ impl BrowserOverlayState {
 #[derive(Default)]
 struct LimitsState {
     cached_content: Option<LimitsOverlayContent>,
+}
+
+#[derive(Clone, Debug)]
+struct GlobalUsageState {
+    status: GlobalUsageStatus,
+    summary: Option<String>,
+    last_error: Option<String>,
+}
+
+impl Default for GlobalUsageState {
+    fn default() -> Self {
+        Self {
+            status: GlobalUsageStatus::Idle,
+            summary: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum GlobalUsageStatus {
+    #[default]
+    Idle,
+    Processing,
+    Ready,
+    Error,
 }
 
 struct HelpOverlay {

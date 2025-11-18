@@ -29,18 +29,30 @@ pub(crate) fn account_display_label(account: &StoredAccount) -> String {
         }
     }
 
+    let is_default_root = !account.id.starts_with("slot-");
+
     match account.mode {
-        AuthMode::ChatGPT => account
-            .tokens
-            .as_ref()
-            .and_then(|tokens| tokens.id_token.email.clone())
-            .map(|email| format!("ChatGPT ({email})"))
-            .unwrap_or_else(|| "ChatGPT".to_string()),
-        AuthMode::ApiKey => account
-            .openai_api_key
-            .as_ref()
-            .map(|key| format!("API key (…{})", key_suffix(key)))
-            .unwrap_or_else(|| "API key".to_string()),
+        AuthMode::ChatGPT => {
+            if is_default_root {
+                return "Default Account".to_string();
+            }
+            account
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.id_token.email.clone())
+                .map(|email| format!("ChatGPT ({email})"))
+                .unwrap_or_else(|| "ChatGPT".to_string())
+        }
+        AuthMode::ApiKey => {
+            if is_default_root {
+                return "Default API key".to_string();
+            }
+            account
+                .openai_api_key
+                .as_ref()
+                .map(|key| format!("API key (…{})", key_suffix(key)))
+                .unwrap_or_else(|| "API key".to_string())
+        }
     }
 }
 

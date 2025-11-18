@@ -257,6 +257,16 @@ pub fn get_auth_file(code_home: &Path) -> PathBuf {
     code_home.join("auth.json")
 }
 
+/// Resolve the default ChatGPT auth the CLI would use for the given code_home
+/// (including legacy paths and env override handling) and return the parsed
+/// AuthDotJson if present.
+pub fn load_default_chatgpt_auth(code_home: &Path) -> std::io::Result<Option<AuthDotJson>> {
+    // Mirror the canonical ChatGPT-first selection used by CodexAuth::from_code_home.
+    let auth = load_auth(code_home, true, AuthMode::ChatGPT, "code_cli_rs")?;
+    Ok(auth
+        .and_then(|a| a.auth_dot_json.lock().ok().and_then(|g| g.clone())))
+}
+
 /// Delete the auth.json file inside `code_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
 pub fn logout(code_home: &Path) -> std::io::Result<bool> {
