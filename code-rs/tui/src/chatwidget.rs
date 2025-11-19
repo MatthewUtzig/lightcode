@@ -6907,6 +6907,15 @@ impl ChatWidget<'_> {
         text.dim().into()
     }
 
+    fn tab_title_for_account(account: &StoredAccount) -> String {
+        if let Some(tokens) = &account.tokens {
+            if let Some(email) = tokens.id_token.email.as_deref() {
+                return email.to_string();
+            }
+        }
+        account_display_label(account)
+    }
+
     fn selection_override_line(
         label: &str,
         kind: LimitOverrideKind,
@@ -7116,10 +7125,11 @@ impl ChatWidget<'_> {
         }
 
         let mut live_snapshot = current_snapshot;
-        let main_account_id = Self::resolve_main_account_id(active_id.clone(), &account_map);
-        if let Some(main_id) = main_account_id.clone() {
+
+        // Always include slot-default immediately after Aggregate.
+        if let Some(default_acc) = account_map.get("slot-default") {
             if let Some(tab) = self.build_account_limits_tab(
-                &main_id,
+                &default_acc.id,
                 &mut live_snapshot,
                 current_reset.clone(),
                 &account_map,
@@ -7127,10 +7137,12 @@ impl ChatWidget<'_> {
                 &mut usage_summary_map,
                 &selection_chances,
             ) {
-                seen_ids.insert(main_id);
+                seen_ids.insert(default_acc.id.clone());
                 tabs.push(tab);
             }
         }
+
+        let _main_account_id = Self::resolve_main_account_id(active_id.clone(), &account_map);
 
         if let Some(target_id) = live_snapshot
             .as_ref()
@@ -7163,11 +7175,11 @@ impl ChatWidget<'_> {
 
         let account_sort_key = |id: &String| {
             if let Some(account) = account_map.get(id) {
-                let label = account_display_label(account);
+                let title = Self::tab_title_for_account(account);
                 (
                     account_mode_priority(account.mode),
-                    label.to_ascii_lowercase(),
-                    label,
+                    title.to_ascii_lowercase(),
+                    title,
                 )
             } else {
                 (u8::MAX, id.to_ascii_lowercase(), id.clone())
@@ -8156,7 +8168,7 @@ impl ChatWidget<'_> {
         // Show a single account-level selection summary in the header only.
         if let Some(sel) = selection_chances.accounts.get(account_id) {
             header.push(Self::selection_account_summary_line(
-                account.map(|acc| account_display_label(acc)).as_deref(),
+                account.map(|acc| Self::tab_title_for_account(acc)).as_deref(),
                 sel,
             ));
         }
@@ -8168,7 +8180,7 @@ impl ChatWidget<'_> {
             }
         }
         let title = account
-            .map(account_display_label)
+            .map(Self::tab_title_for_account)
             .unwrap_or_else(|| account_id.to_string());
 
         if let Some(snapshot) = view_snapshot {
