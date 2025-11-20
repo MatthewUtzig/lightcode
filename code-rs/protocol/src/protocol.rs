@@ -28,6 +28,7 @@ use serde_json::Value;
 use serde_with::serde_as;
 use strum_macros::Display;
 use ts_rs::TS;
+use zeroize::Zeroize;
 
 /// Open/close tags for special user-input blocks. Used across crates to avoid
 /// duplicated hardcoded strings.
@@ -48,6 +49,59 @@ pub struct Submission {
     pub id: String,
     /// Payload
     pub op: Op,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self { Self(value) }
+
+    pub fn into_string(mut self) -> String { std::mem::take(&mut self.0) }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretString(***redacted***)")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Display, TS)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum RunningTaskKind {
+    ForegroundExec,
+    BackgroundExec,
+    Agent,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct RunningTaskInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_id: Option<String>,
+    pub kind: RunningTaskKind,
+    pub label: String,
+    #[serde(default)]
+    pub command_line: Vec<String>,
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub can_cancel: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct RunningTasksSnapshotEvent {
+    pub tasks: Vec<RunningTaskInfo>,
 }
 
 /// Submission operation
@@ -180,6 +234,19 @@ pub enum Op {
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
 
+    /// Request the list of running tasks for the task manager overlay.
+    ListRunningTasks,
+
+    /// Terminate an individual running task (foreground exec, background exec, or agent).
+    TerminateTask {
+        /// Unique identifier for the task (call id or sub id depending on kind).
+        id: String,
+        /// Optional sub id for tasks associated with a turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
+        kind: RunningTaskKind,
+    },
+
     /// Request the full in-memory conversation transcript for the current session.
     /// Reply is delivered via `EventMsg::ConversationHistory`.
     GetPath,
@@ -201,6 +268,17 @@ pub enum Op {
 
     /// Request to shut down codex instance.
     Shutdown,
+
+    /// Provide the sudo password requested for a pending exec command.
+    SubmitSudoPassword {
+        call_id: String,
+        password: SecretString,
+    },
+
+    /// Cancel a sudo password request without providing credentials.
+    CancelSudoPassword {
+        call_id: String,
+    },
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -565,6 +643,9 @@ pub enum EventMsg {
 
     ExecApprovalRequest(ExecApprovalRequestEvent),
 
+    /// Prompt the UI to collect a sudo password for an exec command.
+    SudoPasswordRequest(SudoPasswordRequestEvent),
+
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
 
     BackgroundEvent(BackgroundEventEvent),
@@ -592,6 +673,9 @@ pub enum EventMsg {
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
 
     PlanUpdate(UpdatePlanArgs),
+
+    /// Snapshot of running tasks for the task manager overlay.
+    RunningTasksSnapshot(RunningTasksSnapshotEvent),
 
     TurnAborted(TurnAbortedEvent),
 
@@ -1264,6 +1348,21 @@ pub struct ExecApprovalRequestEvent {
     /// Optional human-readable reason for the approval (e.g. retry without sandbox).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SudoPasswordRequestEvent {
+    /// Identifier for the exec call that needs sudo credentials.
+    pub call_id: String,
+    /// The command that triggered the prompt so the UI can render context.
+    pub command: Vec<String>,
+    /// Working directory of the command.
+    pub cwd: PathBuf,
+    /// 1-based prompt attempt counter so the UI can show retry info.
+    pub attempt: u32,
+    /// Optional explanatory message (e.g., "Incorrect password").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

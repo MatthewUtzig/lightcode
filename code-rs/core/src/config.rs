@@ -17,6 +17,7 @@ use crate::config_types::GithubConfig;
 use crate::config_types::ValidationConfig;
 use crate::config_types::ThemeName;
 use crate::config_types::ThemeColors;
+use crate::config_types::{AiKeySession, AiKeySettings};
 use crate::config_types::McpServerConfig;
 use crate::config_types::McpServerTransportConfig;
 use crate::config_types::Notifications;
@@ -49,12 +50,15 @@ use crate::config_types::ReasoningSummary;
 use crate::project_features::{load_project_commands, ProjectCommand, ProjectHooks};
 use code_app_server_protocol::AuthMode;
 use code_protocol::config_types::SandboxMode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 use dirs::home_dir;
 use serde::Deserialize;
 use serde::de::{self, Unexpected};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -77,6 +81,143 @@ pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5.1-codex";
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
+
+const AI_KEY_DEFAULT_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+const AI_KEY_LONG_LIFETIME: Duration = Duration::from_secs(72 * 60 * 60);
+const AI_KEY_MAX_LIFETIME: Duration = Duration::from_secs(72 * 60 * 60);
+
+#[derive(Clone)]
+pub struct AiKeyStore {
+    inner: Arc<RwLock<AiKeySettings>>,
+    code_home: PathBuf,
+    notify: Arc<Notify>,
+}
+
+impl fmt::Debug for AiKeyStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AiKeyStore")
+            .field("code_home", &self.code_home)
+            .field("settings", &self.snapshot())
+            .finish()
+    }
+}
+
+impl PartialEq for AiKeyStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.code_home == other.code_home && self.snapshot() == other.snapshot()
+    }
+}
+
+impl AiKeyStore {
+    pub fn new(initial: AiKeySettings, code_home: PathBuf) -> Self {
+        let mut sanitized = initial;
+        Self::clamp_session(&mut sanitized, Self::now_epoch());
+        Self {
+            inner: Arc::new(RwLock::new(sanitized)),
+            code_home,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn snapshot(&self) -> AiKeySettings {
+        self.inner.read().unwrap().clone()
+    }
+
+    pub fn remember_long_session(&self) -> bool {
+        self.inner.read().unwrap().remember_long_session
+    }
+
+    pub fn set_remember_long_session(&self, enabled: bool) {
+        self.write_with(|settings| settings.remember_long_session = enabled);
+    }
+
+    pub fn clear_session(&self) {
+        self.write_with(|settings| settings.session = None);
+    }
+
+    pub fn mark_loaded(&self, use_long_session: bool) {
+        let lifetime = if use_long_session {
+            AI_KEY_LONG_LIFETIME
+        } else {
+            AI_KEY_DEFAULT_LIFETIME
+        };
+        self.mark_loaded_with_lifetime(lifetime);
+    }
+
+    pub fn mark_loaded_with_lifetime(&self, lifetime: Duration) {
+        self.write_with(|settings| {
+            let now = Self::now_epoch();
+            let lifetime_secs = lifetime.as_secs() as i64;
+            let mut expires = now.saturating_add(lifetime_secs);
+            let max_future = now.saturating_add(AI_KEY_MAX_LIFETIME.as_secs() as i64);
+            if expires > max_future {
+                expires = max_future;
+            }
+            settings.session = Some(AiKeySession {
+                loaded_at_epoch: now,
+                expires_at_epoch: expires,
+            });
+            Self::clamp_session(settings, now);
+        });
+    }
+
+    pub fn is_session_valid(&self) -> bool {
+        let now = Self::now_epoch();
+        let guard = self.inner.read().unwrap();
+        guard
+            .session
+            .as_ref()
+            .map(|session| session.expires_at_epoch > now)
+            .unwrap_or(false)
+    }
+
+    pub async fn wait_for_session_valid(&self) {
+        loop {
+            if self.is_session_valid() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn write_with<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut AiKeySettings),
+    {
+        let mut guard = self.inner.write().unwrap();
+        f(&mut guard);
+        let snapshot = guard.clone();
+        drop(guard);
+        self.persist(&snapshot);
+        self.notify.notify_waiters();
+    }
+
+    fn clamp_session(settings: &mut AiKeySettings, now: i64) {
+        if let Some(session) = settings.session.as_mut() {
+            if session.expires_at_epoch <= now {
+                settings.session = None;
+                return;
+            }
+            let max_future = now.saturating_add(AI_KEY_MAX_LIFETIME.as_secs() as i64);
+            if session.expires_at_epoch > max_future {
+                session.expires_at_epoch = max_future;
+            }
+        }
+    }
+
+    fn persist(&self, settings: &AiKeySettings) {
+        if let Err(err) = crate::config::set_ai_key_settings(&self.code_home, settings) {
+            tracing::warn!("failed to persist AI key settings: {err}");
+        }
+    }
+
+    fn now_epoch() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+}
 
 const DEFAULT_RESPONSES_ORIGINATOR_HEADER: &str = "code_cli_rs";
 
@@ -244,6 +385,9 @@ pub struct Config {
     /// Settings that govern if and what will be written to `~/.code/history.jsonl`
     /// (Code still reads legacy `~/.codex/history.jsonl`).
     pub history: History,
+
+    /// Persisted AI key session metadata for git operations.
+    pub ai_key: AiKeyStore,
 
     /// Optional URI-based file opener. If set, citations to files in the model
     /// output will be hyperlinked using the specified URI scheme.
@@ -1087,6 +1231,46 @@ pub fn set_auto_drive_settings(
     };
     doc["auto_drive"]["continue_mode"] = toml_edit::value(mode_str);
 
+    if let Some(timeout) = settings.inactivity_timeout_minutes {
+        doc["auto_drive"]["inactivity_timeout_minutes"] =
+            toml_edit::value(i64::from(timeout));
+    } else if let Some(table) = doc["auto_drive"].as_table_mut() {
+        table.remove("inactivity_timeout_minutes");
+    }
+
+    std::fs::create_dir_all(code_home)?;
+    let tmp_file = NamedTempFile::new_in(code_home)?;
+    std::fs::write(tmp_file.path(), doc.to_string())?;
+    tmp_file.persist(config_path)?;
+
+    Ok(())
+}
+
+/// Persist the AI key settings under `[ai_key]`.
+pub fn set_ai_key_settings(code_home: &Path, settings: &AiKeySettings) -> anyhow::Result<()> {
+    let config_path = code_home.join(CONFIG_TOML_FILE);
+    let read_path = resolve_code_path_for_read(code_home, Path::new(CONFIG_TOML_FILE));
+
+    let mut doc = match std::fs::read_to_string(&read_path) {
+        Ok(contents) => contents.parse::<DocumentMut>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    if !settings.remember_long_session && settings.session.is_none() {
+        doc.as_table_mut().remove("ai_key");
+    } else {
+        doc["ai_key"]["remember_long_session"] = toml_edit::value(settings.remember_long_session);
+        if let Some(session) = settings.session.as_ref() {
+            doc["ai_key"]["session"]["loaded_at_epoch"] =
+                toml_edit::value(session.loaded_at_epoch);
+            doc["ai_key"]["session"]["expires_at_epoch"] =
+                toml_edit::value(session.expires_at_epoch);
+        } else if let Some(table) = doc["ai_key"].as_table_mut() {
+            table.remove("session");
+        }
+    }
+
     std::fs::create_dir_all(code_home)?;
     let tmp_file = NamedTempFile::new_in(code_home)?;
     std::fs::write(tmp_file.path(), doc.to_string())?;
@@ -1784,6 +1968,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub history: Option<History>,
 
+    /// AI key configuration and cached session metadata.
+    #[serde(default)]
+    pub ai_key: Option<AiKeySettings>,
+
     /// Optional URI-based file opener. If set, citations to files in the model
     /// output will be hyperlinked using the specified URI scheme.
     pub file_opener: Option<UriBasedFileOpener>,
@@ -2099,6 +2287,8 @@ impl Config {
 
         let mut cfg = cfg;
         upgrade_legacy_model_slugs(&mut cfg);
+        let initial_ai_key = cfg.ai_key.clone().unwrap_or_default();
+        let ai_key_store = AiKeyStore::new(initial_ai_key, code_home.clone());
 
         // Destructure ConfigOverrides fully to ensure all overrides are applied.
         let ConfigOverrides {
@@ -2478,6 +2668,7 @@ impl Config {
                 .collect(),
             code_home,
             history,
+            ai_key: ai_key_store,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             tui: cfg.tui.clone().unwrap_or_default(),
             auto_drive: cfg
@@ -2740,6 +2931,10 @@ fn legacy_code_home_dir() -> Option<PathBuf> {
             .get_or_init(compute_legacy_code_home_dir)
             .clone()
     }
+}
+
+pub fn legacy_code_home_dir_for_read() -> Option<PathBuf> {
+    legacy_code_home_dir()
 }
 
 fn path_exists(path: &Path) -> bool {

@@ -3,6 +3,7 @@
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
@@ -42,6 +43,14 @@ impl TaskKind {
             TaskKind::Compact => "compact",
         }
     }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            TaskKind::Regular => "Agent",
+            TaskKind::Review => "Review",
+            TaskKind::Compact => "Compact",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -49,6 +58,8 @@ pub(crate) struct RunningTask {
     pub(crate) handle: AbortHandle,
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn SessionTask>,
+    pub(crate) started_at: SystemTime,
+    pub(crate) label: String,
 }
 
 impl ActiveTurn {
@@ -56,8 +67,11 @@ impl ActiveTurn {
         self.tasks.insert(sub_id, task);
     }
 
-    pub(crate) fn remove_task(&mut self, sub_id: &str) -> bool {
-        self.tasks.swap_remove(sub_id);
+    pub(crate) fn remove_task(&mut self, sub_id: &str) -> Option<RunningTask> {
+        self.tasks.swap_remove(sub_id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 

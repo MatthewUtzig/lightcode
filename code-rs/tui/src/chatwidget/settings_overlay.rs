@@ -28,6 +28,9 @@ use crate::bottom_pane::{
 use crate::chrome_launch::{ChromeLaunchOption, CHROME_LAUNCH_CHOICES};
 use super::limits_overlay::{LimitsOverlay, LimitsOverlayContent};
 use super::{GlobalUsageState, GlobalUsageStatus};
+use code_core::global_usage_tracker::{GlobalUsageSnapshot, UsageBucket, UsageTotals};
+use code_protocol::num_format::format_with_separators;
+use std::cell::Cell;
 use crate::live_wrap::take_prefix_by_width;
 use crate::util::buffer::fill_rect;
 use code_core::config_types::ReasoningEffort;
@@ -814,6 +817,9 @@ pub(crate) struct GlobalUsageSettingsContent {
     app_event_tx: AppEventSender,
     selected_row: usize,
     is_complete: bool,
+    content_scroll: Cell<u16>,
+    body_visible_rows: Cell<u16>,
+    content_len: Cell<usize>,
 }
 
 impl LimitsSettingsContent {
@@ -1087,6 +1093,9 @@ impl GlobalUsageSettingsContent {
             app_event_tx,
             selected_row: 0,
             is_complete: false,
+            content_scroll: Cell::new(0),
+            body_visible_rows: Cell::new(0),
+            content_len: Cell::new(0),
         }
     }
 
@@ -1094,6 +1103,7 @@ impl GlobalUsageSettingsContent {
         self.state = state;
         if matches!(self.state.status, GlobalUsageStatus::Processing) {
             self.selected_row = 0;
+            self.content_scroll.set(0);
         }
     }
 
@@ -1142,21 +1152,8 @@ impl GlobalUsageSettingsContent {
             Span::styled(text.to_string(), style),
         ])
     }
-}
 
-impl SettingsContent for GlobalUsageSettingsContent {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        fill_rect(
-            buf,
-            area,
-            Some(' '),
-            Style::default().bg(crate::colors::background()),
-        );
-
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
+    fn render_actions(&self, area: Rect, buf: &mut Buffer) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(self.status_line());
         lines.push(Line::default());
@@ -1170,9 +1167,9 @@ impl SettingsContent for GlobalUsageSettingsContent {
         lines.push(self.render_action_row(self.selected_row == 1, "Close"));
         lines.push(Line::default());
 
-        if let Some(summary) = &self.state.summary {
+        if let Some(snapshot) = &self.state.snapshot {
             lines.push(Line::from(Span::styled(
-                summary.clone(),
+                self.summary_line(snapshot),
                 Style::default().fg(crate::colors::text()),
             )));
         } else if matches!(self.state.status, GlobalUsageStatus::Idle) {
@@ -1196,6 +1193,242 @@ impl SettingsContent for GlobalUsageSettingsContent {
             .render(area, buf);
     }
 
+    fn render_snapshot(&self, area: Rect, buf: &mut Buffer) {
+        fill_rect(
+            buf,
+            area,
+            Some(' '),
+            Style::default().bg(crate::colors::background()),
+        );
+
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        if let Some(snapshot) = &self.state.snapshot {
+            let lines = self.snapshot_lines(snapshot);
+            self.body_visible_rows.set(area.height.max(1));
+            self.content_len.set(lines.len());
+            let max_scroll = self
+                .content_len
+                .get()
+                .saturating_sub(self.body_visible_rows.get() as usize);
+            let clamped = self
+                .content_scroll
+                .get()
+                .min(max_scroll.min(u16::MAX as usize) as u16);
+            self.content_scroll.set(clamped);
+
+            Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: false })
+                .scroll((clamped, 0))
+                .render(area, buf);
+        } else {
+            let placeholder = if matches!(self.state.status, GlobalUsageStatus::Processing) {
+                "Computing usage…"
+            } else {
+                "No data yet. Run the global usage computation to populate this view."
+            };
+            Paragraph::new(placeholder)
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: true })
+                .render(area, buf);
+        }
+    }
+
+    fn snapshot_lines(&self, snapshot: &GlobalUsageSnapshot) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        lines.push(Line::from(Span::styled(
+            "Totals",
+            Style::default()
+                .fg(crate::colors::text())
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            "  Non-cached input: {}",
+            self.display_tokens(snapshot.totals.non_cached_input_tokens)
+        )));
+        lines.push(Line::from(format!(
+            "  Cached input    : {}",
+            self.display_tokens(snapshot.totals.cached_input_tokens)
+        )));
+        lines.push(Line::from(format!(
+            "  Output          : {}",
+            self.display_tokens(
+                snapshot.totals.output_tokens + snapshot.totals.reasoning_output_tokens
+            )
+        )));
+        lines.push(Line::from(format!(
+            "  Cost            : ${:.2}",
+            snapshot.totals.cost_usd
+        )));
+        lines.push(Line::default());
+
+        lines.push(Line::from(Span::styled(
+            "Recent windows",
+            Style::default().fg(crate::colors::text_dim()),
+        )));
+        self.push_trailing_line(&mut lines, "Last 1 hour", &snapshot.trailing.last_hour);
+        self.push_trailing_line(&mut lines, "Last 12 hours", &snapshot.trailing.last_twelve_hours);
+        self.push_trailing_line(&mut lines, "Last day", &snapshot.trailing.last_day);
+        self.push_trailing_line(&mut lines, "Last 7 days", &snapshot.trailing.last_seven_days);
+        self.push_trailing_line(&mut lines, "Last 30 days", &snapshot.trailing.last_thirty_days);
+        self.push_trailing_line(&mut lines, "Last year", &snapshot.trailing.last_year);
+        lines.push(Line::default());
+
+        if !snapshot.model_usage.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Top models",
+                Style::default().fg(crate::colors::text_dim()),
+            )));
+            for entry in snapshot.model_usage.iter().take(5) {
+                lines.push(Line::from(format!(
+                    "  {:<18} tokens={} cost=${:.2}",
+                    entry.bucket.as_str(),
+                    self.display_tokens(entry.totals.total_tokens),
+                    entry.totals.cost_usd,
+                )));
+            }
+            lines.push(Line::default());
+        }
+
+        if !snapshot.source_usage.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Top sources",
+                Style::default().fg(crate::colors::text_dim()),
+            )));
+            for entry in snapshot.source_usage.iter().take(5) {
+                lines.push(Line::from(format!(
+                    "  {:<22} tokens={} cost=${:.2}",
+                    entry.label,
+                    self.display_tokens(entry.totals.total_tokens),
+                    entry.totals.cost_usd,
+                )));
+            }
+            lines.push(Line::default());
+        }
+
+        self.push_bucket_section(&mut lines, "Hourly (12)", &snapshot.hourly_buckets, 6);
+        self.push_bucket_section(&mut lines, "12-hour (7d)", &snapshot.twelve_hour_buckets, 6);
+        self.push_bucket_section(&mut lines, "Daily (7)", &snapshot.daily_buckets, 6);
+        self.push_bucket_section(&mut lines, "Weekly (8)", &snapshot.weekly_buckets, 4);
+        self.push_bucket_section(&mut lines, "Monthly (6)", &snapshot.monthly_buckets, 4);
+
+        if let Some(session) = &snapshot.largest_session {
+            lines.push(Line::from(Span::styled(
+                "Largest session",
+                Style::default().fg(crate::colors::text_dim()),
+            )));
+            lines.push(Line::from(format!(
+                "  {} [{}] tokens={} cost=${:.2}",
+                session.session_id,
+                session.model_bucket.as_str(),
+                self.display_tokens(session.totals.total_tokens),
+                session.totals.cost_usd,
+            )));
+        }
+
+        lines
+    }
+
+    fn push_trailing_line(&self, lines: &mut Vec<Line<'static>>, label: &str, totals: &UsageTotals) {
+        let text = if totals.total_tokens == 0 {
+            format!("  {label:<14} : —")
+        } else {
+            format!(
+                "  {label:<14} : {} (input {} · cached {} · output {})",
+                self.display_tokens(totals.total_tokens),
+                self.display_tokens(totals.non_cached_input_tokens),
+                self.display_tokens(totals.cached_input_tokens),
+                self.display_tokens(totals.output_tokens + totals.reasoning_output_tokens)
+            )
+        };
+        lines.push(Line::from(text));
+    }
+
+    fn push_bucket_section(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        label: &'static str,
+        buckets: &[UsageBucket],
+        limit: usize,
+    ) {
+        if buckets.is_empty() {
+            return;
+        }
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(crate::colors::text_dim()),
+        )));
+        for bucket in buckets.iter().rev().take(limit).rev() {
+            lines.push(Line::from(format!(
+                "  {}-{} {} (cost ${:.2})",
+                bucket.start.format("%m-%d %H:%M"),
+                bucket.end.format("%H:%M"),
+                self.display_tokens(bucket.totals.total_tokens),
+                bucket.totals.cost_usd,
+            )));
+        }
+        lines.push(Line::default());
+    }
+
+    fn summary_line(&self, snapshot: &GlobalUsageSnapshot) -> String {
+        format!(
+            "{} tokens · ${:.2} · {} last hour",
+            self.display_tokens(snapshot.totals.total_tokens),
+            snapshot.totals.cost_usd,
+            self.display_tokens(snapshot.trailing.last_hour.total_tokens)
+        )
+    }
+
+    fn display_tokens(&self, value: u64) -> String {
+        const SCALES: &[(u64, &str)] = &[
+            (1_000_000_000_000, "T"),
+            (1_000_000_000, "B"),
+            (1_000_000, "M"),
+            (1_000, "K"),
+        ];
+        for (scale, suffix) in SCALES {
+            if value >= *scale {
+                return format!("{:.2}{}", value as f64 / *scale as f64, suffix);
+            }
+        }
+        format_with_separators(value)
+    }
+
+    fn scroll_content(&self, delta: i32) {
+        let current = self.content_scroll.get() as i32;
+        let max = self.max_scroll() as i32;
+        let next = (current + delta).clamp(0, max);
+        self.content_scroll.set(next as u16);
+    }
+
+    fn max_scroll(&self) -> u16 {
+        let visible = self.body_visible_rows.get().max(1) as usize;
+        let len = self.content_len.get();
+        len.saturating_sub(visible).min(u16::MAX as usize) as u16
+    }
+}
+
+impl SettingsContent for GlobalUsageSettingsContent {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        fill_rect(
+            buf,
+            area,
+            Some(' '),
+            Style::default().bg(crate::colors::background()),
+        );
+
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let layout = Layout::vertical([Constraint::Length(6), Constraint::Fill(1)]).split(area);
+        self.render_actions(layout[0], buf);
+        self.render_snapshot(layout[1], buf);
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Up => {
@@ -1210,11 +1443,28 @@ impl SettingsContent for GlobalUsageSettingsContent {
                 }
                 true
             }
+            KeyCode::PageUp => {
+                self.scroll_content(-(self.body_visible_rows.get() as i32));
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_content(self.body_visible_rows.get() as i32);
+                true
+            }
+            KeyCode::Home => {
+                self.content_scroll.set(0);
+                true
+            }
+            KeyCode::End => {
+                let max = self.max_scroll();
+                self.content_scroll.set(max);
+                true
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if self.selected_row == 0 {
                     if !matches!(self.state.status, GlobalUsageStatus::Processing) {
                         self.app_event_tx
-                            .send(AppEvent::RequestGlobalUsageSummary);
+                            .send(AppEvent::RequestGlobalUsageSnapshot);
                     }
                 } else {
                     self.is_complete = true;

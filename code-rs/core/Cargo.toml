@@ -47,6 +47,7 @@ img_hash = "3"
 once_cell = { workspace = true }
 portable-pty = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 regex-lite = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 schemars = "0.8.22"
@@ -78,11 +79,13 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tree-sitter = { workspace = true }
+zeroize = { workspace = true }
 tree-sitter-bash = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 url = "2"
 which = { workspace = true }
 wildmatch = { workspace = true }
+walkdir = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

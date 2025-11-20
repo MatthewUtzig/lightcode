@@ -1,22 +1,16 @@
 use chrono::{DateTime, Utc};
 use code_app_server_protocol::AuthMode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::auth;
-use crate::config::resolve_code_path_for_read;
+use crate::account_slots;
 use crate::token_data::TokenData;
-use dirs::home_dir;
 
 const ACCOUNTS_FILE_NAME: &str = "auth_accounts.json";
-const SLOT_PREFIX: &str = "slot";
-const MAX_SLOT_DEPTH: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredAccount {
@@ -88,7 +82,7 @@ fn read_accounts_file(path: &Path) -> io::Result<AccountsFile> {
 fn write_accounts_file(path: &Path, data: &AccountsFile) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
     }
 
@@ -206,7 +200,7 @@ pub fn list_accounts(code_home: &Path) -> io::Result<Vec<StoredAccount>> {
     let path = accounts_file_path(code_home);
     let data = read_accounts_file(&path)?;
     let mut accounts = data.accounts;
-    match discover_slot_accounts(code_home) {
+    match account_slots::discover_slot_accounts(code_home) {
         Ok(mut slots) => accounts.append(&mut slots),
         Err(err) => warn!(?err, "failed to load slot-based accounts"),
     }
@@ -230,7 +224,7 @@ pub fn find_account(code_home: &Path, account_id: &str) -> io::Result<Option<Sto
         return Ok(Some(account));
     }
 
-    match discover_slot_accounts(code_home) {
+    match account_slots::discover_slot_accounts(code_home) {
         Ok(slots) => Ok(slots.into_iter().find(|acc| acc.id == account_id)),
         Err(err) => {
             warn!(?err, "failed to load slot-based accounts");
@@ -323,273 +317,6 @@ pub fn upsert_api_key_account(
     Ok(stored)
 }
 
-fn discover_slot_accounts(code_home: &Path) -> io::Result<Vec<StoredAccount>> {
-    let mut accounts = Vec::new();
-    let mut seen_ids = HashSet::new();
-    for root in slot_roots(code_home) {
-        if let Err(err) = scan_slot_root(&root, &mut seen_ids, &mut accounts) {
-            if err.kind() == ErrorKind::NotFound {
-                continue;
-            }
-            return Err(err);
-        }
-    }
-
-    // Also surface a virtual "default" slot that points at the primary auth
-    // file even when no slot directories exist.
-    if let Err(err) = push_default_slot_account(code_home, &mut seen_ids, &mut accounts) {
-        if err.kind() != ErrorKind::NotFound {
-            return Err(err);
-        }
-    }
-
-    accounts.sort_by(|a, b| slot_display_key(a).cmp(&slot_display_key(b)));
-    Ok(accounts)
-}
-
-fn slot_roots(code_home: &Path) -> Vec<PathBuf> {
-    fn push_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
-        if candidate.exists() && !roots.iter().any(|root| root == &candidate) {
-            roots.push(candidate);
-        }
-    }
-
-    let mut roots = vec![code_home.to_path_buf()];
-    let read_path = resolve_code_path_for_read(code_home, Path::new("auth.json"));
-    if let Some(parent) = read_path.parent() {
-        push_root(&mut roots, parent.to_path_buf());
-    }
-    if let Some(legacy) = legacy_code_home_dir() {
-        push_root(&mut roots, legacy);
-    }
-    roots
-}
-
-fn legacy_code_home_dir() -> Option<PathBuf> {
-    if env_overrides_present() {
-        return None;
-    }
-    let home = home_dir()?;
-    let candidate = home.join(".codex");
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-fn env_overrides_present() -> bool {
-    matches!(env::var("CODE_HOME"), Ok(ref v) if !v.trim().is_empty())
-        || matches!(env::var("CODEX_HOME"), Ok(ref v) if !v.trim().is_empty())
-}
-
-fn scan_slot_root(
-    root: &Path,
-    seen_ids: &mut HashSet<String>,
-    out: &mut Vec<StoredAccount>,
-) -> io::Result<()> {
-    // Prefer the same canonical default selection that the CLI uses when it
-    // resolves auth.json for ChatGPT flows. We intentionally do NOT consider
-    // the OPENAI_API_KEY env var here because slot-default is meant to mirror
-    // the persisted default ChatGPT identity, not ad-hoc environment overrides.
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
-        if !name.to_ascii_lowercase().starts_with(SLOT_PREFIX) {
-            continue;
-        }
-        scan_slot_dir(entry.path(), vec![name], 0, seen_ids, out)?;
-    }
-
-    Ok(())
-}
-
-fn scan_slot_dir(
-    path: PathBuf,
-    components: Vec<String>,
-    depth: usize,
-    seen_ids: &mut HashSet<String>,
-    out: &mut Vec<StoredAccount>,
-) -> io::Result<()> {
-    if depth > MAX_SLOT_DEPTH {
-        return Ok(());
-    }
-
-    let auth_path = path.join("auth.json");
-    if auth_path.is_file() {
-        match auth::try_read_auth_json(&auth_path) {
-            Ok(auth_json) => push_slot_account(auth_json, &components, seen_ids, out),
-            Err(err) => warn!(?auth_path, ?err, "failed to read slot auth file"),
-        }
-        return Ok(());
-    }
-
-    if depth == MAX_SLOT_DEPTH {
-        return Ok(());
-    }
-
-    let entries = match fs::read_dir(&path) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let mut next_components = components.clone();
-        next_components.push(name);
-        scan_slot_dir(entry.path(), next_components, depth + 1, seen_ids, out)?;
-    }
-
-    Ok(())
-}
-
-fn push_slot_account(
-    auth_json: auth::AuthDotJson,
-    components: &[String],
-    seen_ids: &mut HashSet<String>,
-    out: &mut Vec<StoredAccount>,
-) {
-    let base_id = make_slot_id_slug(components);
-    let id = ensure_unique_slot_id(&base_id, seen_ids);
-    let mut label = format!("Slot {}", slot_label(components));
-    let mut tokens = auth_json.tokens.clone();
-    let mode = if auth_json.tokens.is_some() {
-        AuthMode::ChatGPT
-    } else {
-        AuthMode::ApiKey
-    };
-
-    if let (AuthMode::ChatGPT, Some(tokens_ref)) = (&mode, auth_json.tokens.as_ref()) {
-        if let Some(email) = tokens_ref.id_token.email.as_deref() {
-            let trimmed = email.trim();
-            if !trimmed.is_empty() {
-                label = trimmed.to_string();
-            }
-        }
-
-        // Ensure we always retain the account_id when constructing slot accounts.
-        // Some token captures drop account_id; mirror CLI default behavior by
-        // preserving whatever was present in auth.json.
-        if tokens_ref.account_id.is_none() {
-            tokens = Some(tokens_ref.clone());
-        }
-    }
-
-    out.push(StoredAccount {
-        id,
-        mode,
-        label: Some(label),
-        openai_api_key: auth_json.openai_api_key,
-        tokens,
-        last_refresh: auth_json.last_refresh,
-        created_at: None,
-        last_used_at: None,
-    });
-}
-
-fn push_default_slot_account(
-    code_home: &Path,
-    seen_ids: &mut HashSet<String>,
-    out: &mut Vec<StoredAccount>,
-) -> io::Result<()> {
-    let auth_json = match auth::load_default_chatgpt_auth(code_home)? {
-        Some(json) => json,
-        None => return Ok(()),
-    };
-    // Ignore pure API-key-only auth; slot-default should mirror the ChatGPT identity.
-    if auth_json.tokens.is_none() && auth_json.openai_api_key.is_none() {
-        return Ok(());
-    }
-    push_slot_account(auth_json, &["default".to_string()], seen_ids, out);
-    Ok(())
-}
-
-fn slot_display_key(account: &StoredAccount) -> String {
-    account
-        .label
-        .clone()
-        .unwrap_or_else(|| account.id.clone())
-        .to_ascii_lowercase()
-}
-
-fn slot_label(components: &[String]) -> String {
-    if components.is_empty() {
-        return "account".to_string();
-    }
-    components.join(" / ")
-}
-
-fn make_slot_id_slug(components: &[String]) -> String {
-    let parts: Vec<String> = components
-        .iter()
-        .map(|component| sanitize_slot_component(component))
-        .filter(|component| !component.is_empty())
-        .collect();
-    let slug = if parts.is_empty() {
-        "slot".to_string()
-    } else {
-        parts.join("-")
-    };
-    format!("slot-{slug}")
-}
-
-fn sanitize_slot_component(component: &str) -> String {
-    let mut slug = String::new();
-    for ch in component.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-        } else if !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-fn ensure_unique_slot_id(base: &str, seen_ids: &mut HashSet<String>) -> String {
-    if seen_ids.insert(base.to_string()) {
-        return base.to_string();
-    }
-
-    let mut counter = 2usize;
-    loop {
-        let candidate = format!("{base}-{counter}");
-        if seen_ids.insert(candidate.clone()) {
-            return candidate;
-        }
-        counter += 1;
-    }
-}
 
 pub fn upsert_chatgpt_account(
     code_home: &Path,
@@ -637,7 +364,6 @@ mod tests {
     use crate::auth::{write_auth_json, AuthDotJson};
     use crate::token_data::{IdTokenInfo, TokenData};
     use tempfile::tempdir;
-    use std::env;
 
     fn make_chatgpt_tokens(account_id: Option<&str>, email: Option<&str>) -> TokenData {
         fn fake_jwt(account_id: Option<&str>, email: Option<&str>, plan: &str) -> String {
@@ -872,9 +598,11 @@ mod tests {
 
     #[test]
     fn default_slot_prefers_legacy_codex_auth() {
-        let original_home = env::var("HOME").ok();
+        let original_home = std::env::var("HOME").ok();
         let temp_home = tempdir().expect("tempdir");
-        env::set_var("HOME", temp_home.path());
+        unsafe {
+            std::env::set_var("HOME", temp_home.path());
+        }
 
         let code_home = temp_home.path().join(".code");
         std::fs::create_dir_all(&code_home).expect("code home");
@@ -928,7 +656,9 @@ mod tests {
         assert_eq!(email, "primary@example.com");
 
         if let Some(prev) = original_home {
-            env::set_var("HOME", prev);
+            unsafe {
+                std::env::set_var("HOME", prev);
+            }
         }
     }
 }

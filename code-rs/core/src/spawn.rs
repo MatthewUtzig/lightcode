@@ -43,9 +43,10 @@ pub(crate) async fn spawn_child_async(
     sandbox_policy: &SandboxPolicy,
     stdio_policy: StdioPolicy,
     env: HashMap<String, String>,
+    stdin_piped: bool,
 ) -> std::io::Result<Child> {
     trace!(
-        "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {sandbox_policy:?} {stdio_policy:?} {env:?}"
+        "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {sandbox_policy:?} {stdio_policy:?} {env:?} stdin_piped={stdin_piped}"
     );
 
     let mut cmd = Command::new(&program);
@@ -86,11 +87,15 @@ pub(crate) async fn spawn_child_async(
 
     match stdio_policy {
         StdioPolicy::RedirectForShellTool => {
-            // Do not create a file descriptor for stdin because otherwise some
-            // commands may hang forever waiting for input. For example, ripgrep has
-            // a heuristic where it may try to read from stdin as explained here:
-            // https://github.com/BurntSushi/ripgrep/blob/e2362d4d5185d02fa857bf381e7bd52e66fafc73/crates/core/flags/hiargs.rs#L1101-L1103
-            cmd.stdin(Stdio::null());
+            if stdin_piped {
+                cmd.stdin(Stdio::piped());
+            } else {
+                // Do not create a file descriptor for stdin because otherwise some
+                // commands may hang forever waiting for input. For example, ripgrep has
+                // a heuristic where it may try to read from stdin as explained here:
+                // https://github.com/BurntSushi/ripgrep/blob/e2362d4d5185d02fa857bf381e7bd52e66fafc73/crates/core/flags/hiargs.rs#L1101-L1103
+                cmd.stdin(Stdio::null());
+            }
 
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }

@@ -57,5 +57,6 @@ tokio = { workspace = true, features = [
 ] }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+libc = { workspace = true }
 
 [dev-dependencies]

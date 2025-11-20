@@ -31,6 +31,7 @@ members = [
     "responses-api-proxy",
     "otel",
     "tui",
+    "token-usage",
     "git-apply",
     "utils/json-to-toml",
     "utils/readiness",
@@ -192,6 +193,7 @@ which = "6"
 wildmatch = "2.5.0"
 wiremock = "0.6"
 zeroize = "1.8.1"
+rayon = "1.10.0"
 
 [workspace.lints]
 rust = {}

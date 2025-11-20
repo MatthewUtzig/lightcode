@@ -1161,15 +1161,15 @@ impl App<'_> {
                     AppState::Chat { widget } => widget.on_rate_limit_refresh_failed(message),
                     AppState::Onboarding { .. } => {}
                 },
-                AppEvent::RequestGlobalUsageSummary => match &mut self.app_state {
+                AppEvent::RequestGlobalUsageSnapshot => match &mut self.app_state {
                     AppState::Chat { widget } => widget.on_request_global_usage_summary(),
                     AppState::Onboarding { .. } => {}
                 },
-                AppEvent::GlobalUsageSummaryReady { summary } => match &mut self.app_state {
-                    AppState::Chat { widget } => widget.on_global_usage_summary_ready(summary),
+                AppEvent::GlobalUsageSnapshotReady { snapshot } => match &mut self.app_state {
+                    AppState::Chat { widget } => widget.on_global_usage_summary_ready(snapshot),
                     AppState::Onboarding { .. } => {}
                 },
-                AppEvent::GlobalUsageSummaryFailed { message } => match &mut self.app_state {
+                AppEvent::GlobalUsageSnapshotFailed { message } => match &mut self.app_state {
                     AppState::Chat { widget } => widget.on_global_usage_summary_failed(message),
                     AppState::Onboarding { .. } => {}
                 },
@@ -2080,6 +2080,11 @@ impl App<'_> {
                         SlashCommand::Status => {
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 widget.add_status_output();
+                            }
+                        }
+                        SlashCommand::Tasks => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_tasks_command(command_args);
                             }
                         }
                         SlashCommand::Limits => {

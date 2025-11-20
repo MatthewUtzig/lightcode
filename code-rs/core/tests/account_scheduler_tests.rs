@@ -189,7 +189,7 @@ fn smooth_weighted_round_robin_balances_equal_weights() {
 
     let mut counts: HashMap<String, usize> = HashMap::new();
     for _ in 0..20 {
-        let pick = scheduler.next_account(now).unwrap().account_id;
+        let pick = scheduler.next_account(None, now).unwrap().account_id;
         if pick == acc_a.id || pick == acc_b.id {
             *counts.entry(pick).or_insert(0) += 1;
         }
@@ -218,7 +218,7 @@ fn smooth_weighted_round_robin_respects_weight_ratios() {
     let mut heavy_count = 0;
     let mut light_count = 0;
     for _ in 0..40 {
-        let id = scheduler.next_account(now).unwrap().account_id;
+        let id = scheduler.next_account(None, now).unwrap().account_id;
         if id == heavy.id {
             heavy_count += 1;
         } else if id == light.id {
@@ -242,7 +242,7 @@ fn scheduler_skips_account_during_cooldown() {
     let mut scheduler = AccountScheduler::new(home.path().to_path_buf());
     let now = Utc::now();
 
-    let first = scheduler.next_account(now).unwrap();
+    let first = scheduler.next_account(None, now).unwrap();
     scheduler.record_outcome(
         &first.account_id,
         SchedulerOutcome::RateLimited {
@@ -250,7 +250,7 @@ fn scheduler_skips_account_during_cooldown() {
         },
     );
 
-    let second = scheduler.next_account(now).unwrap();
+    let second = scheduler.next_account(None, now).unwrap();
     assert_ne!(first.account_id, second.account_id);
 }
 
@@ -265,7 +265,7 @@ fn cooldown_expires_and_account_returns() {
     let mut scheduler = AccountScheduler::new(home.path().to_path_buf());
     let now = Utc::now();
 
-    let first = scheduler.next_account(now).unwrap();
+    let first = scheduler.next_account(None, now).unwrap();
     scheduler.record_outcome(
         &first.account_id,
         SchedulerOutcome::RateLimited {
@@ -274,10 +274,10 @@ fn cooldown_expires_and_account_returns() {
     );
 
     // Still blocked before resume time.
-    assert!(scheduler.next_account(now + Duration::seconds(5)).is_none());
+    assert!(scheduler.next_account(None, now + Duration::seconds(5)).is_none());
 
     // Available after cooldown passes.
-    let after = scheduler.next_account(now + Duration::seconds(15)).unwrap();
+    let after = scheduler.next_account(None, now + Duration::seconds(15)).unwrap();
     assert_eq!(after.account_id, first.account_id);
 }
 
@@ -335,7 +335,7 @@ fn scheduler_handles_duplicate_slots_and_cooldowns() {
     let mut scheduler = AccountScheduler::new(home.path().to_path_buf());
     let mut actual_order = Vec::new();
     for _ in 0..12 {
-        let selection = scheduler.next_account(now).unwrap();
+        let selection = scheduler.next_account(None, now).unwrap();
         let identity = identity_map.get(&selection.account_id).unwrap().clone();
         actual_order.push(identity);
     }
@@ -356,14 +356,94 @@ fn scheduler_handles_duplicate_slots_and_cooldowns() {
 
     for _ in 0..5 {
         let identity = identity_map
-            .get(&scheduler.next_account(now).unwrap().account_id)
+            .get(&scheduler.next_account(None, now).unwrap().account_id)
             .unwrap();
         assert_ne!(identity, &heavy_identity, "cooled identity should be skipped");
     }
 
     let resumed_identity = identity_map
-        .get(&scheduler.next_account(now + Duration::seconds(31)).unwrap().account_id)
+        .get(
+            &scheduler
+                .next_account(None, now + Duration::seconds(31))
+                .unwrap()
+                .account_id,
+        )
         .unwrap()
         .clone();
     assert_eq!(resumed_identity, heavy_identity);
+}
+
+#[test]
+fn context_reuses_account_within_hold_period() {
+    let home = tempdir().unwrap();
+    let _guard = CodeHomeGuard::new(home.path());
+    let acc_a = upsert_api_key_account(home.path(), "sk-a".into(), None, false).unwrap();
+    let acc_b = upsert_api_key_account(home.path(), "sk-b".into(), None, false).unwrap();
+
+    record_snapshot(home.path(), &acc_a.id, 40.0);
+    record_snapshot(home.path(), &acc_b.id, 60.0);
+
+    let mut scheduler = AccountScheduler::new(home.path().to_path_buf());
+    let now = Utc::now();
+
+    let ctx = "ctx-stick";
+    let first = scheduler.next_account(Some(ctx), now).unwrap().account_id;
+    let second = scheduler
+        .next_account(Some(ctx), now + Duration::minutes(1))
+        .unwrap()
+        .account_id;
+
+    assert_eq!(first, second, "context should reuse account before 5 minutes");
+}
+
+#[test]
+fn context_rotates_after_hold_period() {
+    let home = tempdir().unwrap();
+    let _guard = CodeHomeGuard::new(home.path());
+    let acc_a = upsert_api_key_account(home.path(), "sk-a".into(), None, false).unwrap();
+    let acc_b = upsert_api_key_account(home.path(), "sk-b".into(), None, false).unwrap();
+
+    record_snapshot(home.path(), &acc_a.id, 45.0);
+    record_snapshot(home.path(), &acc_b.id, 55.0);
+
+    let mut scheduler = AccountScheduler::new(home.path().to_path_buf());
+    let now = Utc::now();
+
+    let ctx = "ctx-rotate";
+    let first = scheduler.next_account(Some(ctx), now).unwrap().account_id;
+    let second = scheduler
+        .next_account(Some(ctx), now + Duration::minutes(5) + Duration::seconds(1))
+        .unwrap()
+        .account_id;
+
+    assert_ne!(first, second, "context should rotate after hold period when alternatives exist");
+}
+
+#[test]
+fn rate_limit_releases_context_binding() {
+    let home = tempdir().unwrap();
+    let _guard = CodeHomeGuard::new(home.path());
+    let acc_a = upsert_api_key_account(home.path(), "sk-a".into(), None, false).unwrap();
+    let acc_b = upsert_api_key_account(home.path(), "sk-b".into(), None, false).unwrap();
+
+    record_snapshot(home.path(), &acc_a.id, 30.0);
+    record_snapshot(home.path(), &acc_b.id, 30.0);
+
+    let mut scheduler = AccountScheduler::new(home.path().to_path_buf());
+    let now = Utc::now();
+
+    let ctx = "ctx-limit";
+    let first = scheduler.next_account(Some(ctx), now).unwrap();
+    scheduler.record_outcome(
+        &first.account_id,
+        SchedulerOutcome::RateLimited {
+            resume_at: Some(now + Duration::seconds(60)),
+        },
+    );
+
+    let retry = scheduler
+        .next_account(Some(ctx), now + Duration::seconds(1))
+        .unwrap();
+
+    assert_ne!(first.account_id, retry.account_id, "context should move to a different account after TPM limit");
 }

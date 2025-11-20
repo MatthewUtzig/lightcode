@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -88,6 +88,7 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 const HOOK_OUTPUT_LIMIT: usize = 2048;
 const PENDING_ONLY_SENTINEL: &str = "__code_pending_only__";
 const MIN_SHELL_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+pub const AI_KEY_APPROVAL_REASON_PREFIX: &str = "[AI_KEY_REQUIRED]";
 
 #[derive(Clone, Default)]
 struct ConfirmGuardRuntime {
@@ -850,7 +851,7 @@ use crate::error::{CodexErr, RetryAfter};
 use crate::error::Result as CodexResult;
 use crate::error::SandboxErr;
 use crate::error::get_error_message_ui;
-use crate::exec::ExecParams;
+use crate::exec::{ExecParams, ExecStdin};
 use crate::exec::ExecToolCallOutput;
 use crate::exec::SandboxType;
 use crate::exec::StdoutStream;
@@ -894,7 +895,14 @@ use crate::protocol::BrowserScreenshotUpdateEvent;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
-use crate::protocol::{BrowserSnapshotEvent, EnvironmentContextDeltaEvent, EnvironmentContextFullEvent};
+use crate::protocol::{
+    BrowserSnapshotEvent,
+    EnvironmentContextDeltaEvent,
+    EnvironmentContextFullEvent,
+    RunningTaskInfo,
+    RunningTaskKind,
+    RunningTasksSnapshotEvent,
+};
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::ExecCommandBeginEvent;
 use crate::protocol::ExecCommandEndEvent;
@@ -925,7 +933,7 @@ use crate::safety::assess_safety_for_untrusted_command;
 use crate::shell;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::user_notification::UserNotification;
-use crate::util::backoff;
+use crate::util::{backoff, strip_bash_lc_and_escape};
 use code_protocol::protocol::SessionSource;
 use crate::rollout::recorder::SessionStateSnapshot;
 use serde_json::Value;
@@ -1138,6 +1146,9 @@ struct RunningExecMeta {
     order_meta: crate::protocol::OrderMeta,
     cancel_flag: Arc<AtomicBool>,
     end_emitted: Arc<AtomicBool>,
+    label: String,
+    command_line: Vec<String>,
+    started_at: SystemTime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1322,6 +1333,8 @@ struct BackgroundExecState {
     task_handle: Option<tokio::task::JoinHandle<()>>,
     order_meta_for_end: crate::protocol::OrderMeta,
     sub_id: String,
+    command_line: Vec<String>,
+    started_at: SystemTime,
 }
 
 /// Context for an initialized model agent
@@ -2394,6 +2407,8 @@ impl Session {
         order_meta: crate::protocol::OrderMeta,
         cancel_flag: Arc<AtomicBool>,
         end_emitted: Arc<AtomicBool>,
+        label: String,
+        command_line: Vec<String>,
     ) {
         let mut state = self.state.lock().unwrap();
         state.running_execs.insert(
@@ -2403,6 +2418,9 @@ impl Session {
                 order_meta,
                 cancel_flag,
                 end_emitted,
+                label,
+                command_line,
+                started_at: SystemTime::now(),
             },
         );
     }
@@ -2493,9 +2511,23 @@ impl Session {
             sequence_number: seq_hint.map(|h| h.saturating_add(1)),
         };
 
+        let ExecInvokeArgs { params, sandbox_type, sandbox_policy, sandbox_cwd, code_linux_sandbox_exe, stdout_stream } = exec_args;
+        let tracking_command = params.command.clone();
+        let command_line_for_tracking = params.command.clone();
+        let display_label_for_tracking: String =
+            strip_bash_lc_and_escape(&begin_ctx.command_for_display);
+
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let end_emitted = Arc::new(AtomicBool::new(false));
-        self.track_running_exec(&call_id, &sub_id, order_for_end.clone(), cancel_flag.clone(), end_emitted.clone());
+        self.track_running_exec(
+            &call_id,
+            &sub_id,
+            order_for_end.clone(),
+            cancel_flag.clone(),
+            end_emitted.clone(),
+            display_label_for_tracking,
+            command_line_for_tracking,
+        );
 
         let mut exec_guard = ExecDropGuard::new(
             self.self_handle.clone(),
@@ -2503,12 +2535,9 @@ impl Session {
             sub_id.clone(),
             call_id.clone(),
             order_for_end.clone(),
-            cancel_flag,
+            cancel_flag.clone(),
             end_emitted,
         );
-
-        let ExecInvokeArgs { params, sandbox_type, sandbox_policy, sandbox_cwd, code_linux_sandbox_exe, stdout_stream } = exec_args;
-        let tracking_command = params.command.clone();
         let dry_run_analysis = analyze_command(&tracking_command);
         let params = maybe_run_with_user_profile(params, self);
         let params_for_hooks = if enable_hooks {
@@ -2540,7 +2569,15 @@ impl Session {
         self.on_exec_command_begin(turn_diff_tracker, begin_ctx.clone(), seq_hint, output_index, attempt_req)
             .await;
 
-        let result = process_exec_tool_call(params, sandbox_type, sandbox_policy, sandbox_cwd, code_linux_sandbox_exe, stdout_stream)
+        let result = process_exec_tool_call(
+            params,
+            sandbox_type,
+            sandbox_policy,
+            sandbox_cwd,
+            code_linux_sandbox_exe,
+            stdout_stream,
+            Some(cancel_flag.clone()),
+        )
         .await;
 
         let output_stderr;
@@ -2750,6 +2787,7 @@ impl Session {
             env,
             with_escalated_permissions: Some(false),
             justification: None,
+            stdin: ExecStdin::Null,
         };
 
         let exec_ctx = ExecCommandContext {
@@ -2839,6 +2877,7 @@ impl Session {
             env,
             with_escalated_permissions: Some(false),
             justification: None,
+            stdin: ExecStdin::Null,
         };
 
         let call_id = format!("project_cmd_{}", sanitize_identifier(&command.name));
@@ -3538,6 +3577,116 @@ impl Session {
             warn!("failed to spawn notifier '{}': {e}", notify_command[0]);
         }
     }
+
+    pub(crate) async fn send_running_tasks_snapshot(&self, sub_id: String) {
+        let tasks = {
+            let state = self.state.lock().unwrap();
+            let mut tasks = Vec::new();
+            if let Some(agent) = state.current_task.as_ref() {
+                let label = agent.kind.display_label().to_string();
+                tasks.push(RunningTaskInfo {
+                    id: agent.sub_id.clone(),
+                    sub_id: Some(agent.sub_id.clone()),
+                    kind: RunningTaskKind::Agent,
+                    label: label.clone(),
+                    command_line: vec![label],
+                    started_at_ms: system_time_to_millis(agent.started_at),
+                    can_cancel: !agent.handle.is_finished(),
+                });
+            }
+
+            for (call_id, meta) in state.running_execs.iter() {
+                tasks.push(RunningTaskInfo {
+                    id: call_id.clone(),
+                    sub_id: Some(meta.sub_id.clone()),
+                    kind: RunningTaskKind::ForegroundExec,
+                    label: meta.label.clone(),
+                    command_line: meta.command_line.clone(),
+                    started_at_ms: system_time_to_millis(meta.started_at),
+                    can_cancel: !meta.end_emitted.load(Ordering::Acquire),
+                });
+            }
+
+            for (call_id, bg) in state.background_execs.iter() {
+                tasks.push(RunningTaskInfo {
+                    id: call_id.clone(),
+                    sub_id: Some(bg.sub_id.clone()),
+                    kind: RunningTaskKind::BackgroundExec,
+                    label: bg.cmd_display.clone(),
+                    command_line: bg.command_line.clone(),
+                    started_at_ms: system_time_to_millis(bg.started_at),
+                    can_cancel: bg.task_handle.is_some(),
+                });
+            }
+
+            tasks.sort_by_key(|info| info.started_at_ms);
+            tasks
+        };
+        let event = self.make_event(&sub_id, EventMsg::RunningTasksSnapshot(RunningTasksSnapshotEvent { tasks }));
+        self.send_event(event).await;
+    }
+
+    pub(crate) async fn cancel_background_exec(&self, call_id: &str) -> Result<String, String> {
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            state.background_execs.remove(call_id)
+        };
+
+        match removed {
+            Some(mut bg) => {
+                bg.suppress_event.store(true, Ordering::Relaxed);
+                bg.notify.notify_waiters();
+                if let Some(handle) = bg.task_handle.take() {
+                    handle.abort();
+                }
+                self.mark_running_exec_as_cancelled(&bg.sub_id);
+                self.finalize_cancelled_execs(&bg.sub_id).await;
+                Ok(format!("Cancelled background task {call_id}"))
+            }
+            None => Err(format!("No running background task for {call_id}")),
+        }
+    }
+
+    pub(crate) async fn abort_running_task(&self, target: &str, reason: TurnAbortReason) -> bool {
+        let exec_info = {
+            let state = self.state.lock().unwrap();
+            if let Some(meta) = state.running_execs.get(target) {
+                Some((meta.sub_id.clone(), meta.cancel_flag.clone()))
+            } else {
+                state
+                    .running_execs
+                    .iter()
+                    .find(|(_, meta)| meta.sub_id == target)
+                    .map(|(_, meta)| (meta.sub_id.clone(), meta.cancel_flag.clone()))
+            }
+        };
+
+        if let Some((sub_id, flag)) = exec_info {
+            flag.store(true, Ordering::Release);
+            self.finalize_cancelled_execs(&sub_id).await;
+            return true;
+        }
+
+        let agent = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(current) = state.current_task.as_ref() {
+                if current.sub_id == target {
+                    state.current_task.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(agent_task) = agent {
+            agent_task.abort(reason);
+            return true;
+        }
+
+        false
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3760,6 +3909,13 @@ fn synthetic_exec_end_payload(cancelled: bool) -> (i32, String) {
         (130, "Command cancelled by user.".to_string())
     } else {
         (130, "Command interrupted before completion.".to_string())
+    }
+}
+
+fn system_time_to_millis(ts: SystemTime) -> u64 {
+    match ts.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        Err(_) => 0,
     }
 }
 
@@ -3988,12 +4144,23 @@ enum AgentTaskKind {
     Compact,
 }
 
+impl AgentTaskKind {
+    fn display_label(&self) -> &'static str {
+        match self {
+            AgentTaskKind::Regular => "Agent turn",
+            AgentTaskKind::Review => "Review turn",
+            AgentTaskKind::Compact => "Compact turn",
+        }
+    }
+}
+
 /// A series of Turns in response to user input.
 pub(crate) struct AgentTask {
     sess: Arc<Session>,
     sub_id: String,
     handle: AbortHandle,
     kind: AgentTaskKind,
+    started_at: SystemTime,
 }
 
 impl AgentTask {
@@ -4017,6 +4184,7 @@ impl AgentTask {
             sub_id,
             handle,
             kind: AgentTaskKind::Regular,
+            started_at: SystemTime::now(),
         }
     }
 
@@ -4046,6 +4214,7 @@ impl AgentTask {
             sub_id,
             handle,
             kind: AgentTaskKind::Compact,
+            started_at: SystemTime::now(),
         }
     }
 
@@ -4069,6 +4238,7 @@ impl AgentTask {
             sub_id,
             handle,
             kind: AgentTaskKind::Review,
+            started_at: SystemTime::now(),
         }
     }
 
@@ -4129,6 +4299,72 @@ async fn submission_loop(
                     sess.notify_wait_interrupted(WaitInterruptReason::SessionAborted);
                     sess.abort();
                 });
+            }
+            Op::ListRunningTasks => {
+                let sess_arc = match sess.as_ref() {
+                    Some(sess) => Arc::clone(sess),
+                    None => {
+                        send_no_session_event(sub.id).await;
+                        continue;
+                    }
+                };
+                sess_arc
+                    .send_running_tasks_snapshot(sub.id.clone())
+                    .await;
+            }
+            Op::TerminateTask { id, sub_id, kind } => {
+                let sess_arc = match sess.as_ref() {
+                    Some(sess) => Arc::clone(sess),
+                    None => {
+                        send_no_session_event(sub.id).await;
+                        continue;
+                    }
+                };
+
+                let (message, success) = match kind {
+                    RunningTaskKind::BackgroundExec => match sess_arc.cancel_background_exec(&id).await {
+                        Ok(status) => (status, true),
+                        Err(err) => (err, false),
+                    },
+                    RunningTaskKind::ForegroundExec | RunningTaskKind::Agent => {
+                        let target = sub_id.as_deref().unwrap_or(&id);
+                        let aborted = sess_arc
+                            .abort_running_task(target, TurnAbortReason::Interrupted)
+                            .await;
+                        if aborted {
+                            (format!("Requested cancellation for task {target}"), true)
+                        } else {
+                            (format!("No running task found for {target}"), false)
+                        }
+                    }
+                };
+
+                let event = Event {
+                    id: sub.id.clone(),
+                    event_seq: 0,
+                    msg: EventMsg::BackgroundEvent(BackgroundEventEvent { message: message.clone() }),
+                    order: None,
+                };
+                sess_arc.send_event(event).await;
+
+                sess_arc
+                    .send_running_tasks_snapshot(sub.id.clone())
+                    .await;
+
+                if !success {
+                    continue;
+                }
+            }
+            Op::SubmitSudoPassword { .. } | Op::CancelSudoPassword { .. } => {
+                let event = Event {
+                    id: sub.id,
+                    event_seq: 0,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "Sudo password prompts are not supported in this build".to_string(),
+                    }),
+                    order: None,
+                };
+                let _ = tx_event.send(event).await;
             }
             Op::CancelAgents { batch_ids, agent_ids } => {
                 let sess_arc = match sess.as_ref() {
@@ -4200,6 +4436,7 @@ async fn submission_loop(
                     sess.set_task(agent);
                 }
             }
+            // (handled earlier)
             Op::ConfigureSession {
                 provider,
                 model,
@@ -5853,7 +6090,7 @@ async fn run_turn(
 
 fn select_scheduler_account(handle: &Arc<Mutex<AccountScheduler>>) -> Option<AccountSelection> {
     let mut scheduler = handle.lock().unwrap();
-    scheduler.next_account(Utc::now())
+    scheduler.next_account(None, Utc::now())
 }
 
 fn ensure_account_is_active(sess: &Session, selection: &AccountSelection) -> CodexResult<()> {
@@ -7874,6 +8111,7 @@ fn to_exec_params(params: ShellToolCallParams, sess: &Session) -> ExecParams {
         env: create_env(&sess.shell_environment_policy),
         with_escalated_permissions: params.with_escalated_permissions,
         justification: params.justification,
+        stdin: ExecStdin::Null,
     }
 }
 
@@ -10451,6 +10689,8 @@ async fn handle_container_exec_with_params(
                 task_handle: None,
                 order_meta_for_end: order_meta_for_end.clone(),
                 sub_id: sub_id.clone(),
+                command_line: params.command.clone(),
+                started_at: SystemTime::now(),
             },
         );
     }
@@ -10503,6 +10743,7 @@ async fn handle_container_exec_with_params(
             &sandbox_cwd,
             &code_linux_sandbox_exe,
             stdout_stream,
+            None,
         )
         .await;
 

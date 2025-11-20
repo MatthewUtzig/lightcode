@@ -1048,6 +1048,7 @@ dependencies = [
  "ctor 0.5.0",
  "flate2",
  "futures",
+ "libc",
  "owo-colors",
  "regex",
  "reqwest",
@@ -1164,6 +1165,7 @@ dependencies = [
  "portable-pty",
  "pretty_assertions",
  "rand 0.9.2",
+ "rayon",
  "regex-lite",
  "reqwest",
  "schemars 0.8.22",
@@ -1190,10 +1192,12 @@ dependencies = [
  "tree-sitter-bash",
  "url",
  "uuid",
+ "walkdir",
  "which",
  "wildmatch",
  "windows-sys 0.61.2",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -1418,6 +1422,7 @@ dependencies = [
  "tracing",
  "ts-rs",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1462,6 +1467,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "code-token-usage"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "code-core",
+ "crossterm",
+ "ratatui",
  "tracing",
 ]
 

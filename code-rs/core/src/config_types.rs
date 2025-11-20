@@ -729,6 +729,32 @@ impl Default for Tui {
     }
 }
 
+/// Tracks whether the AI key is configured/loaded for git operations.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AiKeySettings {
+    /// When true, "Load" actions keep the session active for up to 72 hours.
+    #[serde(default)]
+    pub remember_long_session: bool,
+    /// Metadata describing the current loaded session, if any.
+    #[serde(default)]
+    pub session: Option<AiKeySession>,
+}
+
+impl Default for AiKeySettings {
+    fn default() -> Self {
+        Self { remember_long_session: false, session: None }
+    }
+}
+
+/// Persisted metadata about the decrypted AI key lifetime.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AiKeySession {
+    /// Seconds since UNIX epoch when the key was loaded.
+    pub loaded_at_epoch: i64,
+    /// Seconds since UNIX epoch when the key expires.
+    pub expires_at_epoch: i64,
+}
+
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct AutoResolveAttemptLimit(u32);
@@ -793,6 +819,9 @@ pub struct AutoDriveSettings {
 
     #[serde(default)]
     pub auto_resolve_review_attempts: AutoResolveAttemptLimit,
+
+    #[serde(default = "default_inactivity_timeout_minutes")]
+    pub inactivity_timeout_minutes: Option<u16>,
 }
 
 impl Default for AutoDriveSettings {
@@ -806,8 +835,13 @@ impl Default for AutoDriveSettings {
             coordinator_routing: true,
             continue_mode: AutoDriveContinueMode::TenSeconds,
             auto_resolve_review_attempts: AutoResolveAttemptLimit::default(),
+            inactivity_timeout_minutes: default_inactivity_timeout_minutes(),
         }
     }
+}
+
+fn default_inactivity_timeout_minutes() -> Option<u16> {
+    Some(60)
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

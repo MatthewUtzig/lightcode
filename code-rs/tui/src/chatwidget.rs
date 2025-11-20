@@ -40,6 +40,7 @@ use code_core::config_types::AutoDriveContinueMode;
 use code_core::config_types::Notifications;
 use code_core::config_types::ReasoningEffort;
 use code_core::config_types::TextVerbosity;
+use code_core::global_usage_tracker::GlobalUsageSnapshot;
 use code_core::plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use code_core::model_family::derive_default_model_family;
 use code_core::model_family::find_family_for_model;
@@ -128,6 +129,7 @@ mod web_search_sessions;
 mod auto_drive_cards;
 pub(crate) mod tool_cards;
 mod running_tools;
+mod task_manager;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod smoke_helpers;
 use self::agent_install::{
@@ -137,6 +139,7 @@ use self::agent_install::{
     start_upgrade_terminal_session,
     wrap_command,
 };
+use self::task_manager::TaskManagerState;
 use code_auto_drive_core::{
     start_auto_coordinator,
     AutoCoordinatorCommand,
@@ -200,6 +203,7 @@ use code_core::protocol::EnvironmentContextDeltaEvent;
 use code_core::protocol::EnvironmentContextFullEvent;
 use code_core::protocol::InputItem;
 use code_core::protocol::SessionConfiguredEvent;
+use code_core::protocol::SecretString;
 // MCP tool call handlers moved into chatwidget::tools
 use code_core::protocol::Op;
 use code_core::protocol::ReviewOutputEvent;
@@ -209,6 +213,7 @@ use code_core::protocol::PatchApplyEndEvent;
 use code_core::protocol::TaskCompleteEvent;
 use code_core::protocol::TokenUsage;
 use code_core::protocol::TurnDiffEvent;
+use code_core::protocol::SudoPasswordRequestEvent;
 use code_core::codex::compact::COMPACTION_CHECKPOINT_MESSAGE;
 use crate::bottom_pane::{
     AutoActiveViewModel,
@@ -804,8 +809,7 @@ use code_git_tooling::{
     GhostCommit,
     GitToolingError,
 };
-use crossterm::event::KeyEvent;
-use crossterm::event::KeyEventKind;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use image::imageops::FilterType;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -814,6 +818,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
+use ratatui::widgets::Wrap;
 use ratatui_image::picker::Picker;
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc;
@@ -1033,8 +1038,6 @@ use crate::rate_limits_view::{
 use crate::session_log;
 use code_core::review_format::format_review_findings_block;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc};
-use crossterm::event::KeyCode;
-use crossterm::event::KeyModifiers;
 use ratatui::style::Stylize;
 use ratatui::symbols::scrollbar as scrollbar_symbols;
 use ratatui::text::Span;
@@ -1377,6 +1380,12 @@ pub(crate) struct ChatWidget<'a> {
 
     // Limits overlay state
     limits: LimitsState,
+
+    // Task manager overlay state
+    task_manager: TaskManagerState,
+
+    // Active sudo password prompt overlay
+    sudo_prompt: Option<SudoPromptState>,
 
     // Global usage state for settings overlay
     global_usage: GlobalUsageState,
@@ -4005,6 +4014,83 @@ impl ChatWidget<'_> {
             }, ticket);
     }
 
+    fn handle_sudo_password_request(&mut self, event: SudoPasswordRequestEvent) {
+        self.finalize_active_stream();
+        self.flush_interrupt_queue();
+        self.sudo_prompt = Some(SudoPromptState::new(event));
+        self.request_redraw();
+    }
+
+    fn handle_sudo_prompt_key(&mut self, key: KeyEvent) -> bool {
+        let Some(prompt) = self.sudo_prompt.as_mut() else {
+            return false;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return true;
+        }
+        match key.code {
+            KeyCode::Enter => self.submit_sudo_password(),
+            KeyCode::Esc => self.cancel_sudo_prompt(),
+            KeyCode::Backspace => {
+                prompt.backspace();
+                self.request_redraw();
+            }
+            KeyCode::Delete => {
+                prompt.delete();
+                self.request_redraw();
+            }
+            KeyCode::Left => {
+                prompt.move_left();
+                self.request_redraw();
+            }
+            KeyCode::Right => {
+                prompt.move_right();
+                self.request_redraw();
+            }
+            KeyCode::Home => {
+                prompt.move_start();
+                self.request_redraw();
+            }
+            KeyCode::End => {
+                prompt.move_end();
+                self.request_redraw();
+            }
+            KeyCode::Char(c) => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    return true;
+                }
+                prompt.insert_char(c);
+                self.request_redraw();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn submit_sudo_password(&mut self) {
+        if let Some(mut prompt) = self.sudo_prompt.take() {
+            let password = std::mem::take(&mut prompt.input);
+            let secret = SecretString::new(password);
+            self.submit_op(Op::SubmitSudoPassword {
+                call_id: prompt.call_id.clone(),
+                password: secret,
+            });
+            self.request_redraw();
+        }
+    }
+
+    fn cancel_sudo_prompt(&mut self) {
+        if let Some(prompt) = self.sudo_prompt.take() {
+            self.submit_op(Op::CancelSudoPassword {
+                call_id: prompt.call_id.clone(),
+            });
+            self.request_redraw();
+        }
+    }
+
     /// Handle apply patch approval request immediately
     fn handle_apply_patch_approval_now(&mut self, _id: String, ev: ApplyPatchApprovalRequestEvent) {
         let ApplyPatchApprovalRequestEvent {
@@ -5084,6 +5170,8 @@ impl ChatWidget<'_> {
             },
             settings: SettingsState::default(),
             limits: LimitsState::default(),
+            task_manager: TaskManagerState::default(),
+            sudo_prompt: None,
             global_usage: GlobalUsageState::default(),
             terminal: TerminalState::default(),
             pending_manual_terminal: HashMap::new(),
@@ -5413,6 +5501,8 @@ impl ChatWidget<'_> {
             },
             settings: SettingsState::default(),
             limits: LimitsState::default(),
+            task_manager: TaskManagerState::default(),
+            sudo_prompt: None,
             global_usage: GlobalUsageState::default(),
             terminal: TerminalState::default(),
             pending_manual_terminal: HashMap::new(),
@@ -6166,6 +6256,12 @@ impl ChatWidget<'_> {
         if self.diffs.overlay.is_some() {
             return;
         }
+        if self.handle_sudo_prompt_key(key_event) {
+            return;
+        }
+        if task_manager::handle_key(self, key_event) {
+            return;
+        }
         if self.browser_overlay_visible {
             let is_ctrl_b = matches!(
                 key_event,
@@ -6234,7 +6330,6 @@ impl ChatWidget<'_> {
             return;
         }
         if self.agents_terminal.active {
-            use crossterm::event::KeyCode;
             if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 return;
             }
@@ -8252,6 +8347,11 @@ impl ChatWidget<'_> {
 
     pub(crate) fn handle_paste(&mut self, text: String) {
         if settings_handlers::handle_settings_paste(self, text.clone()) {
+            return;
+        }
+        if let Some(prompt) = self.sudo_prompt.as_mut() {
+            prompt.insert_text(&text);
+            self.request_redraw();
             return;
         }
         // Check if the pasted text is a file path to an image
@@ -12364,6 +12464,9 @@ impl ChatWidget<'_> {
                 };
                 self.apply_plan_terminal_title(desired_title);
             }
+            EventMsg::RunningTasksSnapshot(ev) => {
+                task_manager::handle_running_tasks_snapshot(self, ev);
+            }
             EventMsg::ExecApprovalRequest(ev) => {
                 let id2 = id.clone();
                 let ev2 = ev.clone();
@@ -12377,6 +12480,9 @@ impl ChatWidget<'_> {
                         this.request_redraw();
                     },
                 );
+            }
+            EventMsg::SudoPasswordRequest(ev) => {
+                self.handle_sudo_password_request(ev);
             }
             EventMsg::ApplyPatchApprovalRequest(ev) => {
                 let id2 = id.clone();
@@ -14111,7 +14217,7 @@ impl ChatWidget<'_> {
         }
 
         self.global_usage.status = GlobalUsageStatus::Processing;
-        self.global_usage.summary = None;
+        self.global_usage.snapshot = None;
         self.global_usage.last_error = None;
         self.update_global_usage_overlay_state();
         self.refresh_settings_overview_rows();
@@ -14120,9 +14226,9 @@ impl ChatWidget<'_> {
         start_global_usage_refresh(self.app_event_tx.clone(), self.config.code_home.clone());
     }
 
-    pub(crate) fn on_global_usage_summary_ready(&mut self, summary: String) {
+    pub(crate) fn on_global_usage_summary_ready(&mut self, snapshot: GlobalUsageSnapshot) {
         self.global_usage.status = GlobalUsageStatus::Ready;
-        self.global_usage.summary = Some(summary);
+        self.global_usage.snapshot = Some(snapshot);
         self.global_usage.last_error = None;
         self.update_global_usage_overlay_state();
         self.refresh_settings_overview_rows();
@@ -14537,6 +14643,18 @@ impl ChatWidget<'_> {
             ));
         }
         self.show_settings_overlay(Some(SettingsSection::Limits));
+    }
+
+    pub(crate) fn handle_tasks_command(&mut self, args: String) {
+        if !args.trim().is_empty() {
+            self.history_push_plain_state(history_cell::new_error_event(
+                "Usage: /tasks".to_string(),
+            ));
+            return;
+        }
+        self.task_manager.begin_refresh();
+        self.request_running_tasks_snapshot();
+        self.mark_needs_redraw();
     }
 
     pub(crate) fn handle_login_command(&mut self) {
@@ -20742,9 +20860,9 @@ Have we met every part of this goal and is there no further work to do?"#
             GlobalUsageStatus::Processing => Some("Global usage: processing…".to_string()),
             GlobalUsageStatus::Ready => self
                 .global_usage
-                .summary
+                .snapshot
                 .as_ref()
-                .map(|s| format!("Global usage: {}", s)),
+                .map(|s| format!("Global usage: {}", Self::format_global_usage_summary(s))),
             GlobalUsageStatus::Error => self.global_usage.last_error.as_ref().map(|msg| {
                 let trimmed = msg.split('\n').next().unwrap_or(msg);
                 format!("Global usage: error ({trimmed})")
@@ -20770,6 +20888,32 @@ Have we met every part of this goal and is there no further work to do?"#
                 content.update_state(self.global_usage.clone());
             }
         }
+    }
+
+    fn format_global_usage_summary(snapshot: &GlobalUsageSnapshot) -> String {
+        let total = Self::format_compact_tokens(snapshot.totals.total_tokens);
+        let last_hour = Self::format_compact_tokens(snapshot.trailing.last_hour.total_tokens);
+        format!(
+            "{} · ${:.2} · {} last hour",
+            total,
+            snapshot.totals.cost_usd,
+            last_hour
+        )
+    }
+
+    fn format_compact_tokens(value: u64) -> String {
+        const SCALES: &[(u64, &str)] = &[
+            (1_000_000_000_000, "T"),
+            (1_000_000_000, "B"),
+            (1_000_000, "M"),
+            (1_000, "K"),
+        ];
+        for (scale, suffix) in SCALES {
+            if value >= *scale {
+                return format!("{:.2}{}", value as f64 / *scale as f64, suffix);
+            }
+        }
+        format_with_separators(value)
     }
 
     fn format_reasoning_effort(effort: ReasoningEffort) -> &'static str {
@@ -21268,6 +21412,15 @@ Have we met every part of this goal and is there no further work to do?"#
     /// Returns CancellationEvent::Handled if the event was consumed by the UI, or
     /// CancellationEvent::Ignored if the caller should handle it (e.g. exit).
     pub(crate) fn on_ctrl_c(&mut self) -> CancellationEvent {
+        if self.sudo_prompt.is_some() {
+            self.cancel_sudo_prompt();
+            return CancellationEvent::Handled;
+        }
+        if self.task_manager.is_visible() {
+            self.task_manager.close();
+            self.request_redraw();
+            return CancellationEvent::Handled;
+        }
         if let Some(id) = self.terminal_overlay_id() {
             if self.terminal_is_running() {
                 self.request_terminal_cancel(id);
@@ -21670,6 +21823,8 @@ Have we met every part of this goal and is there no further work to do?"#
             || self.diffs.overlay.is_some()
             || self.help.overlay.is_some()
             || self.terminal.overlay.is_some()
+            || self.task_manager.is_visible()
+            || self.sudo_prompt.is_some()
     }
 
     /// Forward an `Op` directly to codex.
@@ -31434,7 +31589,6 @@ impl ChatWidget<'_> {
         use ratatui::widgets::Sparkline;
         use ratatui::widgets::SparklineBar;
         use ratatui::widgets::Widget;
-        use ratatui::widgets::Wrap;
 
         // Update sparkline data for animation
         if !self.active_agents.is_empty() || self.agents_ready_to_start {
@@ -31914,6 +32068,156 @@ impl ChatWidget<'_> {
 
             let sparkline = Sparkline::default().data(bars).max(max_value); // Dynamic max for better visibility
             sparkline.render(sparkline_area, buf);
+        }
+    }
+
+    fn render_sudo_prompt_overlay(&self, history_area: Rect, buf: &mut Buffer) {
+        let Some(prompt) = &self.sudo_prompt else {
+            return;
+        };
+        let scrim_style = Style::default()
+            .bg(crate::colors::overlay_scrim())
+            .fg(crate::colors::text_dim());
+        fill_rect(buf, history_area, None, scrim_style);
+
+        let width = history_area.width.saturating_sub(6).min(88).max(48);
+        let base_height = 10u16
+            .saturating_add(prompt.message.as_ref().map(|_| 1).unwrap_or(0));
+        let height = base_height.min(history_area.height.saturating_sub(2).max(6));
+        let x = history_area.x + (history_area.width.saturating_sub(width)) / 2;
+        let y = history_area.y + (history_area.height.saturating_sub(height)) / 2;
+        let window = Rect { x, y, width, height };
+
+        Clear.render(window, buf);
+        let title = Line::from(vec![
+            Span::styled(
+                " Sudo password required ",
+                Style::default()
+                    .fg(crate::colors::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " — Enter submit · Esc cancel",
+                Style::default().fg(crate::colors::text_dim()),
+            ),
+        ]);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(Style::default().bg(crate::colors::background()))
+            .border_style(
+                Style::default()
+                    .fg(crate::colors::border())
+                    .bg(crate::colors::background()),
+            );
+        let inner = block.inner(window);
+        block.render(window, buf);
+
+        let layout = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+        if layout.len() < 3 {
+            return;
+        }
+        let header_area = layout[0];
+        let password_area = layout[1];
+        let footer_area = layout[2];
+
+        if header_area.height > 0 {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("Command: ", Style::default().fg(crate::colors::text_dim())),
+                    Span::styled(
+                        prompt.command_display(),
+                        Style::default().fg(crate::colors::text()),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Working dir: ",
+                        Style::default().fg(crate::colors::text_dim()),
+                    ),
+                    Span::styled(
+                        prompt.cwd_display(),
+                        Style::default().fg(crate::colors::text()),
+                    ),
+                ]),
+            ];
+            lines.push(Line::from(vec![Span::styled(
+                format!("Attempt {}", prompt.attempt),
+                Style::default().fg(crate::colors::text_dim()),
+            )]));
+            if let Some(message) = &prompt.message {
+                lines.push(Line::from(vec![Span::styled(
+                    message.clone(),
+                    Style::default().fg(crate::colors::warning()),
+                )]));
+            }
+            let paragraph = Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .style(
+                    Style::default()
+                        .bg(crate::colors::background())
+                        .fg(crate::colors::text()),
+                );
+            Widget::render(paragraph, header_area, buf);
+        }
+
+        if password_area.height > 0 {
+            let field_block = Block::default()
+                .borders(Borders::ALL)
+                .title("Password")
+                .style(Style::default().bg(crate::colors::background()))
+                .border_style(Style::default().fg(crate::colors::border()));
+            let field_inner = field_block.inner(password_area);
+            field_block.render(password_area, buf);
+
+            if field_inner.width > 0 && field_inner.height > 0 {
+                fill_rect(
+                    buf,
+                    field_inner,
+                    None,
+                    Style::default().bg(crate::colors::background()),
+                );
+                let text_rect = Rect {
+                    x: field_inner.x + 1,
+                    y: field_inner.y + field_inner.height / 2,
+                    width: field_inner.width.saturating_sub(2),
+                    height: 1,
+                };
+                if text_rect.width > 0 {
+                    let (display, cursor_col) =
+                        prompt.visible_password(text_rect.width as usize);
+                    let line = Line::from(vec![Span::styled(
+                        display,
+                        Style::default().fg(crate::colors::text()),
+                    )]);
+                    let paragraph = Paragraph::new(line).wrap(Wrap { trim: false });
+                    Widget::render(paragraph, text_rect, buf);
+                    let cursor_x = text_rect
+                        .x
+                        .saturating_add(cursor_col.min(text_rect.width.saturating_sub(1) as usize) as u16);
+                    buf[(cursor_x, text_rect.y)].set_style(
+                        Style::default()
+                            .bg(crate::colors::text())
+                            .fg(crate::colors::background()),
+                    );
+                }
+            }
+        }
+
+        if footer_area.height > 0 {
+            let instructions = Line::from(vec![Span::styled(
+                "Enter submit  ·  Esc cancel",
+                Style::default()
+                    .fg(crate::colors::text_dim())
+                    .add_modifier(Modifier::ITALIC),
+            )]);
+            let paragraph = Paragraph::new(vec![instructions]).wrap(Wrap { trim: true });
+            Widget::render(paragraph, footer_area, buf);
         }
     }
 }
@@ -33729,8 +34033,9 @@ impl WidgetRef for &ChatWidget<'_> {
                 }
             }
 
-            // Render help overlay (covering the history area) if active
-            if self.settings.overlay.is_none() {
+            if self.task_manager.is_visible() {
+                task_manager::render_task_manager_overlay(self, area, history_area, buf);
+            } else if self.settings.overlay.is_none() {
                 if let Some(overlay) = &self.help.overlay {
                     // Global scrim across widget
                     let scrim_bg = Style::default()
@@ -33808,6 +34113,10 @@ impl WidgetRef for &ChatWidget<'_> {
                         .wrap(ratatui::widgets::Wrap { trim: false });
                     ratatui::widgets::Widget::render(paragraph, body, buf);
                 }
+            }
+
+            if self.sudo_prompt.is_some() {
+                self.render_sudo_prompt_overlay(history_area, buf);
             }
         }
         // Finalize widget render timing
@@ -34110,10 +34419,158 @@ struct LimitsState {
     cached_content: Option<LimitsOverlayContent>,
 }
 
+struct SudoPromptState {
+    call_id: String,
+    command: Vec<String>,
+    cwd: PathBuf,
+    attempt: u32,
+    message: Option<String>,
+    input: String,
+    cursor: usize,
+}
+
+impl SudoPromptState {
+    fn new(event: SudoPasswordRequestEvent) -> Self {
+        Self {
+            call_id: event.call_id,
+            command: event.command,
+            cwd: event.cwd,
+            attempt: event.attempt.max(1),
+            message: event.message,
+            input: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if matches!(ch, '\n' | '\r') {
+            return;
+        }
+        self.input.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if matches!(ch, '\n' | '\r') {
+                continue;
+            }
+            self.insert_char(ch);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        if let Some(prev) = self.input[..self.cursor].chars().next_back() {
+            let len = prev.len_utf8();
+            let start = self.cursor - len;
+            self.input.drain(start..self.cursor);
+            self.cursor = start;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        if let Some(ch) = self.input[self.cursor..].chars().next() {
+            let len = ch.len_utf8();
+            self.input.drain(self.cursor..self.cursor + len);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        if let Some(prev) = self.input[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        if let Some(next) = self.input[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.input.len();
+    }
+
+    fn cursor_char_index(&self) -> usize {
+        self.input[..self.cursor].chars().count()
+    }
+
+    fn visible_password(&self, max_chars: usize) -> (String, usize) {
+        if max_chars == 0 {
+            return (String::new(), 0);
+        }
+        let cursor_index = self.cursor_char_index();
+        let mut start = 0usize;
+        if cursor_index >= max_chars {
+            start = cursor_index + 1 - max_chars;
+        }
+        let mut display = String::new();
+        let mut idx = 0usize;
+        for _ in self.input.chars() {
+            if idx >= start && display.len() < max_chars {
+                display.push('*');
+            }
+            idx += 1;
+        }
+        if display.is_empty() {
+            display.push(' ');
+        }
+        let cursor = cursor_index
+            .saturating_sub(start)
+            .min(display.len().saturating_sub(1));
+        (display, cursor)
+    }
+
+    fn command_display(&self) -> String {
+        if self.command.is_empty() {
+            "sudo".to_string()
+        } else {
+            self.command.join(" ")
+        }
+    }
+
+    fn cwd_display(&self) -> String {
+        self.cwd.display().to_string()
+    }
+
+    fn zeroize(&mut self) {
+        unsafe {
+            let bytes = self.input.as_mut_vec();
+            for b in bytes.iter_mut() {
+                *b = 0;
+            }
+        }
+        self.input.clear();
+        self.cursor = 0;
+    }
+}
+
+impl Drop for SudoPromptState {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GlobalUsageState {
     status: GlobalUsageStatus,
-    summary: Option<String>,
+    snapshot: Option<GlobalUsageSnapshot>,
     last_error: Option<String>,
 }
 
@@ -34121,7 +34578,7 @@ impl Default for GlobalUsageState {
     fn default() -> Self {
         Self {
             status: GlobalUsageStatus::Idle,
-            summary: None,
+            snapshot: None,
             last_error: None,
         }
     }

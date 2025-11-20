@@ -7,6 +7,7 @@ use code_core::protocol::ValidationGroup;
 use code_core::protocol::ApprovedCommandMatchKind;
 use code_core::protocol::TokenUsage;
 use code_core::git_info::CommitLogEntry;
+use code_core::global_usage_tracker::GlobalUsageSnapshot;
 use code_core::protocol::ReviewContextMetadata;
 use code_file_search::FileMatch;
 use crossterm::event::KeyEvent;
@@ -389,11 +390,11 @@ pub(crate) enum AppEvent {
     RateLimitFetchFailed { message: String },
 
     /// Request a background computation of global token usage across accounts.
-    RequestGlobalUsageSummary,
+    RequestGlobalUsageSnapshot,
     /// Global usage computation finished successfully.
-    GlobalUsageSummaryReady { summary: String },
+    GlobalUsageSnapshotReady { snapshot: GlobalUsageSnapshot },
     /// Global usage computation failed.
-    GlobalUsageSummaryFailed { message: String },
+    GlobalUsageSnapshotFailed { message: String },
 
     #[allow(dead_code)]
     StartCommitAnimation,

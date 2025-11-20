@@ -942,6 +942,7 @@ async fn execute_model_with_permissions(
                     &SandboxPolicy::DangerFullAccess,
                     StdioPolicy::RedirectForShellTool,
                     env.clone(),
+                    false,
                 )
                 .await
             }
@@ -1167,6 +1168,7 @@ async fn execute_cloud_built_in_streaming(
         &SandboxPolicy::DangerFullAccess,
         StdioPolicy::RedirectForShellTool,
         env,
+        false,
     )
     .await
     .map_err(|e| format!("Failed to spawn cloud submit: {}", e))?;

@@ -19,6 +19,8 @@ const R_CAP: f64 = 4.0;
 const U_MIN: f64 = 0.1;
 const U_BASE: f64 = 1.0;
 const U_MAX: f64 = 2.0;
+const CONTEXT_REBIND_AFTER_MINS: i64 = 5;
+const CONTEXT_STALE_AFTER_MINS: i64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct AccountSelection {
@@ -40,6 +42,7 @@ pub struct AccountScheduler {
     code_home: PathBuf,
     cooldowns: HashMap<String, DateTime<Utc>>,
     weights: HashMap<String, WeightedState>,
+    context_bindings: HashMap<String, ContextBinding>,
 }
 
 impl AccountScheduler {
@@ -48,12 +51,19 @@ impl AccountScheduler {
             code_home,
             cooldowns: HashMap::new(),
             weights: HashMap::new(),
+            context_bindings: HashMap::new(),
         }
     }
 
     /// Pick the next account using smooth weighted round‑robin.
-    pub fn next_account(&mut self, now: DateTime<Utc>) -> Option<AccountSelection> {
+    pub fn next_account(&mut self, context: Option<&str>, now: DateTime<Utc>) -> Option<AccountSelection> {
         self.prune_expired_cooldowns(now);
+        self.prune_stale_contexts(now);
+
+        let context = context
+            .map(str::trim)
+            .filter(|ctx| !ctx.is_empty())
+            .map(|ctx| ctx.to_string());
 
         let snapshots = match account_usage::list_rate_limit_snapshots(&self.code_home) {
             Ok(entries) => entries
@@ -76,6 +86,7 @@ impl AccountScheduler {
 
         let mut totals_by_identity: HashMap<String, f64> = HashMap::new();
         let mut slots: Vec<SlotCandidate> = Vec::new();
+        let mut identity_by_account: HashMap<String, String> = HashMap::new();
 
         for account in accounts.iter() {
             if !has_credentials(account) || self.is_blocked(&account.id, now) {
@@ -91,6 +102,7 @@ impl AccountScheduler {
 
             let identity = slot_identity(account);
             *totals_by_identity.entry(identity.clone()).or_insert(0.0) += weight;
+            identity_by_account.insert(account.id.clone(), identity.clone());
 
             slots.push(SlotCandidate {
                 selection: AccountSelection {
@@ -116,6 +128,44 @@ impl AccountScheduler {
             return None;
         }
 
+        let mut forced_account_id: Option<String> = None;
+        let mut forced_identity: Option<String> = None;
+        let mut rotate_away_identity: Option<String> = None;
+
+        let identity_count = totals_by_identity.len();
+
+        if let Some(ctx_key) = context.as_deref() {
+            if let Some(binding) = self.context_bindings.get(ctx_key).cloned() {
+                match identity_by_account.get(&binding.account_id).cloned() {
+                    Some(identity) => {
+                        let age = now.signed_duration_since(binding.assigned_at);
+                        let rebind_after = Duration::minutes(CONTEXT_REBIND_AFTER_MINS);
+                        if age < rebind_after {
+                            forced_account_id = Some(binding.account_id.clone());
+                            forced_identity = Some(identity);
+                            if let Some(existing) = self.context_bindings.get_mut(ctx_key) {
+                                existing.last_used_at = now;
+                            }
+                        } else if identity_count > 1 {
+                            rotate_away_identity = Some(identity);
+                            self.context_bindings.remove(ctx_key);
+                        } else {
+                            // No alternative accounts available; keep binding but reset timer.
+                            if let Some(existing) = self.context_bindings.get_mut(ctx_key) {
+                                existing.assigned_at = now;
+                                existing.last_used_at = now;
+                            }
+                            forced_account_id = Some(binding.account_id.clone());
+                            forced_identity = Some(identity);
+                        }
+                    }
+                    None => {
+                        self.context_bindings.remove(ctx_key);
+                    }
+                }
+            }
+        }
+
         let mut best_identity: Option<String> = None;
         let mut best_current = f64::MIN;
 
@@ -129,30 +179,59 @@ impl AccountScheduler {
                 });
             state.weight = *weight_sum;
             state.current += state.weight;
-            if state.current > best_current {
+
+            let is_excluded = rotate_away_identity
+                .as_ref()
+                .map_or(false, |excluded| excluded == identity && identity_count > 1);
+
+            if !is_excluded && state.current > best_current {
                 best_current = state.current;
                 best_identity = Some(identity.clone());
             }
         }
 
-        let best_identity = best_identity?;
-        if let Some(state) = self.weights.get_mut(&best_identity) {
+        let chosen_identity = if let Some(identity) = forced_identity {
+            identity
+        } else {
+            best_identity?
+        };
+
+        if let Some(state) = self.weights.get_mut(&chosen_identity) {
             state.current -= total_weight;
         }
 
         // Choose a concrete slot for the winning identity. Prefer the heaviest slot, falling back
         // to lexicographic order for determinism.
-        let selection = slots
-            .into_iter()
-            .filter(|slot| slot.identity == best_identity)
+        let mut selection = slots
+            .iter()
+            .filter(|slot| slot.identity == chosen_identity)
             .max_by(|a, b| {
                 a.weight
                     .partial_cmp(&b.weight)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.selection.account_id.cmp(&b.selection.account_id))
             })
-            .map(|slot| slot.selection)
+            .map(|slot| slot.selection.clone())
             .expect("selected identity must have at least one slot");
+
+        if let Some(forced_id) = forced_account_id.as_deref() {
+            if selection.account_id != forced_id {
+                if let Some(slot) = slots.iter().find(|slot| slot.selection.account_id == forced_id) {
+                    selection = slot.selection.clone();
+                }
+            }
+        }
+
+        if let Some(ctx_key) = context.as_ref() {
+            self.context_bindings.insert(
+                ctx_key.clone(),
+                ContextBinding {
+                    account_id: selection.account_id.clone(),
+                    assigned_at: now,
+                    last_used_at: now,
+                },
+            );
+        }
 
         Some(selection)
     }
@@ -167,6 +246,7 @@ impl AccountScheduler {
                     Utc::now() + Duration::seconds(DEFAULT_COOLDOWN_SECS)
                 });
                 self.cooldowns.insert(account_id.to_string(), resume);
+                self.drop_context_bindings_for_account(account_id);
             }
         }
     }
@@ -175,10 +255,21 @@ impl AccountScheduler {
         self.cooldowns.retain(|_, until| *until > now);
     }
 
+    fn prune_stale_contexts(&mut self, now: DateTime<Utc>) {
+        let stale_after = Duration::minutes(CONTEXT_STALE_AFTER_MINS);
+        self.context_bindings
+            .retain(|_, binding| now.signed_duration_since(binding.last_used_at) < stale_after);
+    }
+
     fn is_blocked(&self, account_id: &str, now: DateTime<Utc>) -> bool {
         self.cooldowns
             .get(account_id)
             .map_or(false, |until| *until > now)
+    }
+
+    fn drop_context_bindings_for_account(&mut self, account_id: &str) {
+        self.context_bindings
+            .retain(|_, binding| binding.account_id != account_id);
     }
 }
 
@@ -193,6 +284,13 @@ struct SlotCandidate {
     selection: AccountSelection,
     weight: f64,
     identity: String,
+}
+
+#[derive(Debug, Clone)]
+struct ContextBinding {
+    account_id: String,
+    assigned_at: DateTime<Utc>,
+    last_used_at: DateTime<Utc>,
 }
 
 fn has_credentials(account: &StoredAccount) -> bool {

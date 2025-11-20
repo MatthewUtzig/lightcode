@@ -91,7 +91,9 @@ pub async fn run_conversation_loop(
                     EventMsg::AgentMessage(AgentMessageEvent { .. }) => {
                         // TODO: think how we want to support this in the MCP
                     }
-                    EventMsg::AgentReasoningRawContent(_)
+                    EventMsg::SudoPasswordRequest(_)
+                    | EventMsg::RunningTasksSnapshot(_)
+                    | EventMsg::AgentReasoningRawContent(_)
                     | EventMsg::AgentReasoningRawContentDelta(_)
                     | EventMsg::TaskStarted
                     | EventMsg::TokenCount(_)

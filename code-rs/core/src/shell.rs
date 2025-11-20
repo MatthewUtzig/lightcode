@@ -311,7 +311,7 @@ mod tests {
         for (input, expected_cmd, expected_output) in cases {
             use std::collections::HashMap;
 
-            use crate::exec::ExecParams;
+            use crate::exec::{ExecParams, ExecStdin};
             use crate::exec::SandboxType;
             use crate::exec::process_exec_tool_call;
             use crate::protocol::SandboxPolicy;
@@ -356,11 +356,13 @@ mod tests {
                     )]),
                     with_escalated_permissions: None,
                     justification: None,
+                    stdin: ExecStdin::Null,
                 },
                 SandboxType::None,
                 &SandboxPolicy::DangerFullAccess,
                 temp_home.path(),
                 &None,
+                None,
                 None,
             )
             .await
@@ -421,7 +423,7 @@ mod macos_tests {
             use std::collections::HashMap;
             use std::path::PathBuf;
 
-            use crate::exec::ExecParams;
+            use crate::exec::{ExecParams, ExecStdin};
             use crate::exec::SandboxType;
             use crate::exec::process_exec_tool_call;
             use crate::protocol::SandboxPolicy;
@@ -467,11 +469,13 @@ mod macos_tests {
                     )]),
                     with_escalated_permissions: None,
                     justification: None,
+                    stdin: ExecStdin::Null,
                 },
                 SandboxType::None,
                 &SandboxPolicy::DangerFullAccess,
                 temp_home.path(),
                 &None,
+                None,
                 None,
             )
             .await

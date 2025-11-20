@@ -3,6 +3,7 @@ mod regular;
 mod review;
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use tracing::trace;
@@ -89,6 +90,8 @@ impl Session {
             handle,
             kind: task_kind,
             task,
+            started_at: SystemTime::now(),
+            label: format!("{} turn", task_kind.display_name()),
         };
         self.register_new_active_task(sub_id, running_task).await;
     }
@@ -99,16 +102,43 @@ impl Session {
         }
     }
 
+    pub async fn abort_running_task(
+        self: &Arc<Self>,
+        sub_id: &str,
+        reason: TurnAbortReason,
+    ) -> bool {
+        let removed = {
+            let mut active = self.active_turn.lock().await;
+            if let Some(at) = active.as_mut() {
+                let removed = at.remove_task(sub_id);
+                if at.is_empty() {
+                    *active = None;
+                }
+                removed
+            } else {
+                None
+            }
+        };
+
+        if let Some(task) = removed {
+            self.handle_task_abort(sub_id.to_string(), task, reason).await;
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn on_task_finished(
         self: &Arc<Self>,
         sub_id: String,
         last_agent_message: Option<String>,
     ) {
         let mut active = self.active_turn.lock().await;
-        if let Some(at) = active.as_mut()
-            && at.remove_task(&sub_id)
-        {
-            *active = None;
+        if let Some(at) = active.as_mut() {
+            at.remove_task(&sub_id);
+            if at.is_empty() {
+                *active = None;
+            }
         }
         drop(active);
         let event = Event {

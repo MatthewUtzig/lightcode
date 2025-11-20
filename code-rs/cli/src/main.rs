@@ -16,6 +16,7 @@ use code_cli::login::run_login_with_chatgpt;
 use code_cli::login::run_login_with_device_code;
 use code_cli::login::run_logout;
 mod llm;
+mod usage;
 use llm::{LlmCli, run_llm};
 use code_common::CliConfigOverrides;
 use code_core::find_conversation_path_by_id_str;
@@ -32,10 +33,14 @@ use std::process;
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Handle as TokioHandle};
 
 mod mcp_cmd;
+mod resume_cache;
 
 use crate::mcp_cmd::McpCli;
+use usage::UsageCommand;
+use resume_cache::{lookup_cached_session_for_current_tty, record_session_for_current_tty};
 
 const CLI_COMMAND_NAME: &str = "code";
+const LIGHTCODE_BRAND_OVERRIDE_ENV: &str = "LIGHTCODE_FORCE_RESUME_BRAND";
 pub(crate) const CODEX_SECURE_MODE_ENV_VAR: &str = "CODEX_SECURE_MODE";
 
 /// As early as possible in the process lifecycle, apply hardening measures
@@ -141,6 +146,9 @@ enum Subcommand {
 
     /// Side-channel LLM utilities (no TUI events).
     Llm(LlmCli),
+
+    /// Show a one-shot global token usage summary.
+    Usage(UsageCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -287,23 +295,8 @@ async fn cli_main(code_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()>
                 &mut interactive.config_overrides,
                 root_config_overrides.clone(),
             );
-            let ExitSummary {
-                token_usage,
-                session_id,
-            } = code_tui::run_main(interactive, code_linux_sandbox_exe).await?;
-            if !token_usage.is_zero() {
-                println!(
-                    "{}",
-                    code_core::protocol::FinalOutput::from(token_usage.clone())
-                );
-            }
-            if let Some(session_id) = session_id {
-                println!(
-                    "To continue this session, run {} resume {}",
-                    resume_command_name(),
-                    session_id
-                );
-            }
+            let summary = code_tui::run_main(interactive, code_linux_sandbox_exe).await?;
+            print_exit_summary(summary);
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             prepend_config_flags(
@@ -319,6 +312,13 @@ async fn cli_main(code_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()>
             // Propagate any root-level config overrides (e.g. `-c key=value`).
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
+        }
+        Some(Subcommand::Usage(mut usage_cli)) => {
+            prepend_config_flags(
+                &mut usage_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            usage_cli.run()?;
         }
         Some(Subcommand::AppServer) => {
             code_app_server::run_main(code_linux_sandbox_exe, root_config_overrides).await?;
@@ -336,23 +336,8 @@ async fn cli_main(code_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()>
                 last,
                 config_overrides,
             );
-            let ExitSummary {
-                token_usage,
-                session_id,
-            } = code_tui::run_main(interactive, code_linux_sandbox_exe).await?;
-            if !token_usage.is_zero() {
-                println!(
-                    "{}",
-                    code_core::protocol::FinalOutput::from(token_usage.clone())
-                );
-            }
-            if let Some(session_id) = session_id {
-                println!(
-                    "To continue this session, run {} resume {}",
-                    resume_command_name(),
-                    session_id
-                );
-            }
+            let summary = code_tui::run_main(interactive, code_linux_sandbox_exe).await?;
+            print_exit_summary(summary);
         }
         Some(Subcommand::Login(mut login_cli)) => {
             prepend_config_flags(
@@ -556,25 +541,65 @@ fn apply_resume_directives(
     interactive.resume_last = false;
     interactive.resume_session_id = None;
 
-    match (session_id, last) {
-        (Some(id), _) => {
-            let path = resolve_resume_path(Some(id.as_str()), false)?
-                .ok_or_else(|| anyhow!("No recorded session found with id {id}"))?;
+    if let Some(id) = session_id {
+        let path = resolve_resume_path(Some(id.as_str()), false)?
+            .ok_or_else(|| anyhow!("No recorded session found with id {id}"))?;
+        interactive.resume_session_id = Some(id);
+        push_experimental_resume_override(interactive, &path);
+        return Ok(());
+    }
+
+    if last {
+        let path = resolve_resume_path(None, true)?
+            .ok_or_else(|| anyhow!("No recent sessions found to resume. Start a session with `code` first."))?;
+        interactive.resume_last = true;
+        push_experimental_resume_override(interactive, &path);
+        return Ok(());
+    }
+
+    if try_apply_cached_resume(interactive)? {
+        return Ok(());
+    }
+
+    interactive.resume_picker = true;
+
+    Ok(())
+}
+
+fn try_apply_cached_resume(interactive: &mut TuiCli) -> anyhow::Result<bool> {
+    if !using_lightcode_brand() {
+        return Ok(false);
+    }
+
+    match lookup_cached_session_for_current_tty() {
+        Ok(Some(id)) => {
+            let path = match resolve_resume_path(Some(id.as_str()), false)? {
+                Some(path) => path,
+                None => {
+                    tracing::debug!(session = %id, "cached session missing; falling back to picker");
+                    return Ok(false);
+                }
+            };
             interactive.resume_session_id = Some(id);
             push_experimental_resume_override(interactive, &path);
+            Ok(true)
         }
-        (None, true) => {
-            let path = resolve_resume_path(None, true)?
-                .ok_or_else(|| anyhow!("No recent sessions found to resume. Start a session with `code` first."))?;
-            interactive.resume_last = true;
-            push_experimental_resume_override(interactive, &path);
+        Ok(None) => Ok(false),
+        Err(err) => {
+            tracing::debug!(?err, "failed to load resume cache");
+            Ok(false)
         }
-        (None, false) => {
-            interactive.resume_picker = true;
+    }
+}
+
+fn using_lightcode_brand() -> bool {
+    if let Ok(value) = std::env::var(LIGHTCODE_BRAND_OVERRIDE_ENV) {
+        if !value.is_empty() {
+            return value.eq_ignore_ascii_case("lightcode");
         }
     }
 
-    Ok(())
+    resume_command_name().eq_ignore_ascii_case("lightcode")
 }
 
 fn resolve_resume_path(session_id: Option<&str>, last: bool) -> anyhow::Result<Option<PathBuf>> {
@@ -636,6 +661,30 @@ fn write_completion<W: std::io::Write>(shell: Shell, out: &mut W) {
 
 fn print_completion(cmd: CompletionCommand) {
     write_completion(cmd.shell, &mut std::io::stdout());
+}
+
+fn print_exit_summary(summary: ExitSummary) {
+    let ExitSummary {
+        token_usage,
+        session_id,
+    } = summary;
+
+    if !token_usage.is_zero() {
+        println!(
+            "{}",
+            code_core::protocol::FinalOutput::from(token_usage.clone())
+        );
+    }
+
+    if let Some(session_id) = session_id {
+        let session_str = session_id.to_string();
+        println!(
+            "To continue this session, run {} resume {}",
+            resume_command_name(),
+            session_str
+        );
+        record_session_for_current_tty(&session_str);
+    }
 }
 
 fn order_replay_main(args: OrderReplayArgs) -> anyhow::Result<()> {
@@ -1037,6 +1086,7 @@ async fn doctor_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -1101,6 +1151,29 @@ mod tests {
         assert_eq!(interactive.resume_session_id, None);
     }
 
+    #[test]
+    fn lightcode_resume_without_args_prefers_cached_session() {
+        with_temp_code_home(|code_home| {
+            let session_id = Uuid::new_v4();
+            let session_id_str = session_id.to_string();
+            create_session_fixture(code_home, &session_id);
+
+            let _brand_guard = EnvVarGuard::set_str(LIGHTCODE_BRAND_OVERRIDE_ENV, "lightcode");
+            let _tty_guard =
+                EnvVarGuard::set_str(resume_cache::TTY_OVERRIDE_ENV, "tty://cached-session");
+
+            resume_cache::record_session_for_current_tty(&session_id_str);
+
+            let interactive = finalize_from_args(["codex", "resume"].as_ref());
+            assert!(!interactive.resume_picker);
+            assert!(!interactive.resume_last);
+            assert_eq!(
+                interactive.resume_session_id.as_deref(),
+                Some(session_id_str.as_str())
+            );
+        });
+    }
+
     static CODE_HOME_MUTEX: Mutex<()> = Mutex::new(());
 
     fn with_temp_code_home<F, R>(f: F) -> R
@@ -1134,6 +1207,31 @@ mod tests {
 
     fn remove_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
         unsafe { std::env::remove_var(key) }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            set_env_var(key, value);
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => set_env_var(self.key, value),
+                None => remove_env_var(self.key),
+            }
+        }
     }
 
     fn create_session_fixture(code_home: &Path, id: &Uuid) -> PathBuf {

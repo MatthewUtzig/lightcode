@@ -183,6 +183,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 // Environment context events are consumed by the TUI; the CLI runner
                 // does not surface them alongside the human-readable transcript.
             }
+            EventMsg::SudoPasswordRequest(_) | EventMsg::RunningTasksSnapshot(_) => {
+                // CLI renderer does not currently surface sudo or task snapshot events.
+            }
             EventMsg::TaskStarted => {
                 // Ignore.
             }

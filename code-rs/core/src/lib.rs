@@ -8,6 +8,7 @@
 mod apply_patch;
 pub mod auth;
 pub mod auth_accounts;
+pub mod account_slots;
 pub mod account_usage;
 pub mod account_scheduler;
 pub mod bash;
@@ -29,6 +30,7 @@ pub mod context_timeline;
 pub mod acp;
 pub mod custom_prompts;
 pub mod debug_logger;
+pub mod global_usage_tracker;
 mod environment_context;
 pub mod retention;
 pub mod telemetry;

@@ -230,6 +230,9 @@ async fn run_code_tool_session_inner(
                         .await;
                         continue;
                     }
+                    EventMsg::SudoPasswordRequest(_) | EventMsg::RunningTasksSnapshot(_) => {
+                        continue;
+                    }
                     EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
                         let text = match last_agent_message {
                             Some(msg) => msg.clone(),

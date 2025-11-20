@@ -2,9 +2,7 @@
 use code_core::config_types::ShellEnvironmentPolicy;
 use code_core::error::CodexErr;
 use code_core::error::SandboxErr;
-use code_core::exec::ExecParams;
-use code_core::exec::SandboxType;
-use code_core::exec::process_exec_tool_call;
+use code_core::exec::{ExecParams, ExecStdin, SandboxType, process_exec_tool_call};
 use code_core::exec_env::create_env;
 use code_core::protocol::SandboxPolicy;
 use std::collections::HashMap;
@@ -44,6 +42,7 @@ async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
         env: create_env_from_core_vars(),
         with_escalated_permissions: None,
         justification: None,
+        stdin: ExecStdin::Null,
     };
 
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
@@ -64,6 +63,7 @@ async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
         &sandbox_policy,
         sandbox_cwd.as_path(),
         &codex_linux_sandbox_exe,
+        None,
         None,
     )
     .await
@@ -147,6 +147,7 @@ async fn assert_network_blocked(cmd: &[&str]) {
         env: create_env_from_core_vars(),
         with_escalated_permissions: None,
         justification: None,
+        stdin: ExecStdin::Null,
     };
 
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
@@ -158,6 +159,7 @@ async fn assert_network_blocked(cmd: &[&str]) {
         &sandbox_policy,
         sandbox_cwd.as_path(),
         &codex_linux_sandbox_exe,
+        None,
         None,
     )
     .await;

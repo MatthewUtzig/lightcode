@@ -310,6 +310,7 @@ pub struct AutoDriveController {
     pub pending_agent_actions: Vec<AutoTurnAgentsAction>,
     pub pending_agent_timing: Option<AutoTurnAgentsTiming>,
     pub continue_mode: AutoContinueMode,
+    pub inactivity_timeout: Option<Duration>,
     pub started_at: Option<Instant>,
     pub turns_completed: usize,
     pub last_run_summary: Option<AutoRunSummary>,
@@ -735,6 +736,7 @@ impl AutoDriveController {
         let cross_check_enabled = self.cross_check_enabled;
         let qa_automation_enabled = self.qa_automation_enabled;
         let continue_mode = self.continue_mode;
+        let inactivity_timeout = self.inactivity_timeout;
         let intro_pending = self.intro_pending;
         let intro_started_at = self.intro_started_at;
         let intro_reduced_motion = self.intro_reduced_motion;
@@ -749,6 +751,7 @@ impl AutoDriveController {
         self.cross_check_enabled = cross_check_enabled;
         self.qa_automation_enabled = qa_automation_enabled;
         self.continue_mode = continue_mode;
+        self.inactivity_timeout = inactivity_timeout;
         self.seconds_remaining = self.continue_mode.seconds().unwrap_or(0);
         self.intro_pending = intro_pending;
         self.intro_started_at = intro_started_at;

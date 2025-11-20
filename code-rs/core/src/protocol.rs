@@ -38,6 +38,13 @@ pub use code_protocol::protocol::GitInfo;
 pub use code_protocol::protocol::RolloutItem;
 pub use code_protocol::protocol::RolloutLine;
 pub use code_protocol::protocol::ConversationPathResponseEvent;
+pub use code_protocol::protocol::{
+    RunningTaskInfo,
+    RunningTaskKind,
+    RunningTasksSnapshotEvent,
+    SecretString,
+    SudoPasswordRequestEvent,
+};
 pub use code_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 pub use code_protocol::protocol::ExitedReviewModeEvent;
 
@@ -49,6 +56,7 @@ pub struct Submission {
     /// Payload
     pub op: Op,
 }
+
 
 /// High-level toggles for validation checks.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -208,6 +216,19 @@ pub enum Op {
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
 
+    /// Request the current set of running tasks for task manager overlays.
+    ListRunningTasks,
+
+    /// Request termination of a running task (foreground exec, background exec, or agent).
+    TerminateTask {
+        /// Identifier for the running task.
+        id: String,
+        /// Optional sub-id for exec tasks tied to a specific turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
+        kind: RunningTaskKind,
+    },
+
     /// Request the agent to summarize the current conversation context.
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
@@ -216,6 +237,17 @@ pub enum Op {
     Review { review_request: ReviewRequest },
     /// Request to shut down codex instance.
     Shutdown,
+
+    /// Provide the sudo password requested for a pending exec command.
+    SubmitSudoPassword {
+        call_id: String,
+        password: SecretString,
+    },
+
+    /// Cancel a sudo password request without providing credentials.
+    CancelSudoPassword {
+        call_id: String,
+    },
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -761,6 +793,12 @@ pub enum EventMsg {
     ExecCommandEnd(ExecCommandEndEvent),
 
     ExecApprovalRequest(ExecApprovalRequestEvent),
+
+    /// Prompt the UI to collect a sudo password for an exec command.
+    SudoPasswordRequest(SudoPasswordRequestEvent),
+
+    /// Snapshot of tasks currently running (foreground exec, background exec, agents).
+    RunningTasksSnapshot(RunningTasksSnapshotEvent),
 
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
 
