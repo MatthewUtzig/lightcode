@@ -169,6 +169,12 @@ pub(crate) enum AppEvent {
         countdown_id: u64,
         seconds_left: u8,
     },
+    AutoInactivityTimeout {
+        token: u64,
+    },
+    UpdateAutoDriveTimeout {
+        minutes: Option<u16>,
+    },
     /// Trigger an automatic Auto Drive restart after a transient failure.
     AutoCoordinatorRestart {
         token: u64,

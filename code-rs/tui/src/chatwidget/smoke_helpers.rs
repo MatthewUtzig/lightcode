@@ -332,6 +332,12 @@ impl ChatWidgetHarness {
         self.flush_into_widget();
     }
 
+    pub fn open_misc_settings_overlay(&mut self) {
+        self.chat.ensure_settings_overlay_section(SettingsSection::Misc);
+        self.chat.show_settings_overlay(Some(SettingsSection::Misc));
+        self.flush_into_widget();
+    }
+
     pub fn review_auto_resolve_enabled(&mut self) -> bool {
         self.flush_into_widget();
         self.chat.config.tui.review_auto_resolve

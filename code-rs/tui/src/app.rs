@@ -1837,6 +1837,11 @@ impl App<'_> {
                         );
                     }
                 }
+                AppEvent::UpdateAutoDriveTimeout { minutes } => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.set_auto_drive_inactivity_timeout(minutes);
+                    }
+                }
                 AppEvent::RequestAgentInstall { name, selected_index } => {
                     if let AppState::Chat { widget } = &mut self.app_state {
                         if let Some(launch) = widget.launch_agent_install(name, selected_index) {
@@ -1920,6 +1925,11 @@ impl App<'_> {
                 AppEvent::AutoCoordinatorCountdown { countdown_id, seconds_left } => {
                     if let AppState::Chat { widget } = &mut self.app_state {
                         widget.auto_handle_countdown(countdown_id, seconds_left);
+                    }
+                }
+                AppEvent::AutoInactivityTimeout { token } => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.auto_handle_inactivity_timeout(token);
                     }
                 }
                 AppEvent::AutoCoordinatorRestart { token, attempt } => {

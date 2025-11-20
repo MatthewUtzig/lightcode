@@ -27,7 +27,7 @@ use crate::bottom_pane::{
 };
 use crate::chrome_launch::{ChromeLaunchOption, CHROME_LAUNCH_CHOICES};
 use super::limits_overlay::{LimitsOverlay, LimitsOverlayContent};
-use super::{GlobalUsageState, GlobalUsageStatus};
+use super::{GlobalUsageState, GlobalUsageStatus, AUTO_INACTIVITY_TIMEOUT_OPTIONS};
 use code_core::global_usage_tracker::{GlobalUsageSnapshot, UsageBucket, UsageTotals};
 use code_protocol::num_format::format_with_separators;
 use std::cell::Cell;
@@ -385,6 +385,160 @@ impl SettingsContent for McpSettingsContent {
 
     fn is_complete(&self) -> bool {
         self.view.is_complete()
+    }
+}
+
+pub(crate) struct MiscSettingsContent {
+    view: MiscSettingsView,
+}
+
+impl MiscSettingsContent {
+    pub(crate) fn new(current_timeout: Option<u16>, app_event_tx: AppEventSender) -> Self {
+        Self { view: MiscSettingsView::new(current_timeout, app_event_tx) }
+    }
+
+    pub(crate) fn set_current_timeout(&mut self, minutes: Option<u16>) {
+        self.view.set_current_timeout(minutes);
+    }
+}
+
+impl SettingsContent for MiscSettingsContent {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.view.render(area, buf);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.view.handle_key(key)
+    }
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone)]
+struct MiscSettingsView {
+    selected: usize,
+    current_timeout: Option<u16>,
+    app_event_tx: AppEventSender,
+}
+
+impl MiscSettingsView {
+    fn new(current_timeout: Option<u16>, app_event_tx: AppEventSender) -> Self {
+        let selected = AUTO_INACTIVITY_TIMEOUT_OPTIONS
+            .iter()
+            .position(|(minutes, _)| *minutes == current_timeout)
+            .unwrap_or(0);
+        Self { selected, current_timeout, app_event_tx }
+    }
+
+    fn set_current_timeout(&mut self, minutes: Option<u16>) {
+        self.current_timeout = minutes;
+        if let Some(idx) = AUTO_INACTIVITY_TIMEOUT_OPTIONS
+            .iter()
+            .position(|(option_minutes, _)| *option_minutes == minutes)
+        {
+            self.selected = idx;
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                if self.selected == 0 {
+                    self.selected = AUTO_INACTIVITY_TIMEOUT_OPTIONS.len().saturating_sub(1);
+                } else {
+                    self.selected = self.selected.saturating_sub(1);
+                }
+                true
+            }
+            KeyCode::Down => {
+                self.selected = (self.selected + 1) % AUTO_INACTIVITY_TIMEOUT_OPTIONS.len();
+                true
+            }
+            KeyCode::Home => {
+                self.selected = 0;
+                true
+            }
+            KeyCode::End => {
+                self.selected = AUTO_INACTIVITY_TIMEOUT_OPTIONS.len().saturating_sub(1);
+                true
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                self.apply_selection();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_selection(&mut self) {
+        if let Some(&(minutes, _)) = AUTO_INACTIVITY_TIMEOUT_OPTIONS.get(self.selected) {
+            self.current_timeout = minutes;
+            self.app_event_tx
+                .send(AppEvent::UpdateAutoDriveTimeout { minutes });
+        }
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let chunks: [Rect; 3] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(AUTO_INACTIVITY_TIMEOUT_OPTIONS.len() as u16 * 2),
+        ])
+        .areas(area);
+
+        Paragraph::new("Auto Drive inactivity timeout")
+            .style(Style::default().fg(crate::colors::text()).add_modifier(Modifier::BOLD))
+            .render(chunks[0], buf);
+
+        let instructions = "Use ↑/↓ to choose an Auto Drive inactivity timeout · Enter applies the change";
+        Paragraph::new(instructions)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(crate::colors::text_dim()))
+            .render(chunks[1], buf);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (idx, (minutes, label)) in AUTO_INACTIVITY_TIMEOUT_OPTIONS.iter().enumerate() {
+            let indicator = if idx == self.selected { '›' } else { ' ' };
+            let active = if self.current_timeout == *minutes { '●' } else { '○' };
+            let spans = vec![
+                Span::styled(indicator.to_string(), Style::default().fg(crate::colors::text_dim())),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{} {}", active, label),
+                    Style::default().fg(crate::colors::text()),
+                ),
+            ];
+            let mut description = Self::option_description(*minutes).to_string();
+            if *minutes == Some(60) {
+                description.push_str(" (default)");
+            }
+            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![Span::styled(
+                description,
+                Style::default().fg(crate::colors::text_dim()),
+            )]));
+        }
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(chunks[2], buf);
+    }
+
+    fn option_description(minutes: Option<u16>) -> &'static str {
+        match minutes {
+            None => "Leave Auto Drive running indefinitely until you stop it manually.",
+            Some(15) => "Cancel and resume runs that stall for 15 minutes.",
+            Some(30) => "Cancel and resume runs that stall for 30 minutes.",
+            Some(60) => "Automatically recover runs idle for an hour.",
+            Some(120) => "Give long tasks up to two hours before restarting.",
+            Some(_) => "Automatically recover idle runs after the selected window.",
+        }
     }
 }
 
@@ -1663,6 +1817,7 @@ pub(crate) struct SettingsOverlayView {
     limits_content: Option<LimitsSettingsContent>,
     chrome_content: Option<ChromeSettingsContent>,
     global_usage_content: Option<GlobalUsageSettingsContent>,
+    misc_content: Option<MiscSettingsContent>,
 }
 
 impl SettingsOverlayView {
@@ -1686,6 +1841,7 @@ impl SettingsOverlayView {
             limits_content: None,
             chrome_content: None,
             global_usage_content: None,
+            misc_content: None,
         }
     }
 
@@ -1794,6 +1950,10 @@ impl SettingsOverlayView {
         self.global_usage_content = Some(content);
     }
 
+    pub(crate) fn set_misc_content(&mut self, content: MiscSettingsContent) {
+        self.misc_content = Some(content);
+    }
+
     #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
     pub(crate) fn agents_content(&self) -> Option<&AgentsSettingsContent> {
         self.agents_content.as_ref()
@@ -1817,6 +1977,10 @@ impl SettingsOverlayView {
 
     pub(crate) fn global_usage_content_mut(&mut self) -> Option<&mut GlobalUsageSettingsContent> {
         self.global_usage_content.as_mut()
+    }
+
+    pub(crate) fn misc_content_mut(&mut self) -> Option<&mut MiscSettingsContent> {
+        self.misc_content.as_mut()
     }
 
     pub(crate) fn set_section(&mut self, section: SettingsSection) -> bool {
@@ -2268,6 +2432,7 @@ impl SettingsOverlayView {
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Mcp => "MCP Servers",
             SettingsSection::GlobalUsage => "Global Usage",
+            SettingsSection::Misc => "Misc Settings",
         }
     }
 
@@ -2634,6 +2799,13 @@ impl SettingsOverlayView {
                 }
                 self.render_placeholder(area, buf, SettingsSection::GlobalUsage.placeholder());
             }
+            SettingsSection::Misc => {
+                if let Some(content) = self.misc_content.as_ref() {
+                    content.render(area, buf);
+                    return;
+                }
+                self.render_placeholder(area, buf, SettingsSection::Misc.placeholder());
+            }
         }
     }
 
@@ -2702,6 +2874,10 @@ impl SettingsOverlayView {
                 .global_usage_content
                 .as_mut()
                 .map(|content| content as &mut dyn SettingsContent),
+            SettingsSection::Misc => self
+                .misc_content
+                .as_mut()
+                .map(|content| content as &mut dyn SettingsContent),
         }
     }
 
@@ -2734,6 +2910,11 @@ impl SettingsOverlayView {
             }
             SettingsSection::GlobalUsage => {
                 if let Some(content) = self.global_usage_content.as_mut() {
+                    content.on_close();
+                }
+            }
+            SettingsSection::Misc => {
+                if let Some(content) = self.misc_content.as_mut() {
                     content.on_close();
                 }
             }

@@ -11,7 +11,7 @@ use code_core::protocol::ApplyPatchApprovalRequestEvent;
 use code_core::protocol::EventMsg;
 use code_core::protocol::ExecApprovalRequestEvent;
 use mcp_types::RequestId;
-use tracing::error;
+use tracing::{debug, error};
 
 pub async fn run_conversation_loop(
     codex: Arc<CodexConversation>,
@@ -91,9 +91,17 @@ pub async fn run_conversation_loop(
                     EventMsg::AgentMessage(AgentMessageEvent { .. }) => {
                         // TODO: think how we want to support this in the MCP
                     }
-                    EventMsg::SudoPasswordRequest(_)
-                    | EventMsg::RunningTasksSnapshot(_)
-                    | EventMsg::AgentReasoningRawContent(_)
+                    EventMsg::SudoPasswordRequest(_) => {
+                        error!(
+                            "Ignoring SudoPasswordRequest in MCP conversation loop; sudo UX not implemented"
+                        );
+                    }
+                    EventMsg::RunningTasksSnapshot(_) => {
+                        tracing::debug!(
+                            "Ignoring RunningTasksSnapshot in MCP conversation loop"
+                        );
+                    }
+                    EventMsg::AgentReasoningRawContent(_)
                     | EventMsg::AgentReasoningRawContentDelta(_)
                     | EventMsg::TaskStarted
                     | EventMsg::TokenCount(_)

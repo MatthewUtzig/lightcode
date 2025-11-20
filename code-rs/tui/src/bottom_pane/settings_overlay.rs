@@ -13,10 +13,11 @@ pub(crate) enum SettingsSection {
     Mcp,
     Notifications,
     GlobalUsage,
+    Misc,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [SettingsSection; 13] = [
+    pub(crate) const ALL: [SettingsSection; 14] = [
         SettingsSection::Model,
         SettingsSection::Theme,
         SettingsSection::Updates,
@@ -30,6 +31,7 @@ impl SettingsSection {
         SettingsSection::Notifications,
         SettingsSection::Limits,
         SettingsSection::GlobalUsage,
+        SettingsSection::Misc,
     ];
 
     pub(crate) const fn label(self) -> &'static str {
@@ -47,6 +49,7 @@ impl SettingsSection {
             SettingsSection::Mcp => "MCP",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::GlobalUsage => "Global Usage",
+            SettingsSection::Misc => "Misc",
         }
     }
 
@@ -67,6 +70,7 @@ impl SettingsSection {
             SettingsSection::GlobalUsage => {
                 "Compute a global token usage summary across all accounts."
             }
+            SettingsSection::Misc => "Miscellaneous toggles that don't fit elsewhere.",
         }
     }
 
@@ -85,6 +89,7 @@ impl SettingsSection {
             SettingsSection::Mcp => "MCP server management coming soon.",
             SettingsSection::Notifications => "Notification preferences coming soon.",
             SettingsSection::GlobalUsage => "Run a global token usage summary.",
+            SettingsSection::Misc => "Miscellaneous settings coming soon.",
         }
     }
 
@@ -103,6 +108,7 @@ impl SettingsSection {
             "mcp" => Some(SettingsSection::Mcp),
             "notification" | "notifications" | "notify" | "notif" => Some(SettingsSection::Notifications),
             "global" | "globalusage" | "global-usage" => Some(SettingsSection::GlobalUsage),
+            "misc" | "miscellaneous" | "other" => Some(SettingsSection::Misc),
             _ => None,
         }
     }

@@ -230,7 +230,16 @@ async fn run_code_tool_session_inner(
                         .await;
                         continue;
                     }
-                    EventMsg::SudoPasswordRequest(_) | EventMsg::RunningTasksSnapshot(_) => {
+                    EventMsg::SudoPasswordRequest(_) => {
+                        tracing::warn!(
+                            "Ignoring SudoPasswordRequest in MCP code tool runner; sudo UX not implemented"
+                        );
+                        continue;
+                    }
+                    EventMsg::RunningTasksSnapshot(_) => {
+                        tracing::debug!(
+                            "Ignoring RunningTasksSnapshot in MCP code tool runner"
+                        );
                         continue;
                     }
                     EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {

@@ -301,17 +301,18 @@ pub struct ExitSummary {
 pub fn resume_command_name() -> &'static str {
     static COMMAND: OnceLock<&'static str> = OnceLock::new();
     COMMAND.get_or_init(|| {
-        let arg0 = std::env::args().next();
-        let invoked = arg0
+        let invoked = std::env::args()
+            .next()
             .as_ref()
             .and_then(|value| std::path::Path::new(value).file_name())
             .and_then(|name| name.to_str())
-            .unwrap_or("");
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
 
-        if invoked.eq_ignore_ascii_case("coder") {
-            "coder"
-        } else {
-            "code"
+        match invoked.as_str() {
+            "lightcode" => "lightcode",
+            "coder" => "coder",
+            _ => "code",
         }
     })
 }

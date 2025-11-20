@@ -129,7 +129,6 @@ mod web_search_sessions;
 mod auto_drive_cards;
 pub(crate) mod tool_cards;
 mod running_tools;
-mod task_manager;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod smoke_helpers;
 use self::agent_install::{
@@ -139,7 +138,6 @@ use self::agent_install::{
     start_upgrade_terminal_session,
     wrap_command,
 };
-use self::task_manager::TaskManagerState;
 use code_auto_drive_core::{
     start_auto_coordinator,
     AutoCoordinatorCommand,
@@ -248,6 +246,14 @@ use crate::history::compat::{
 
 pub(crate) const DOUBLE_ESC_HINT: &str = "undo timeline";
 const AUTO_ESC_EXIT_HINT: &str = "Press Esc again to exit Auto Drive";
+const AUTO_INACTIVITY_RESUME_PROMPT: &str = "Resume Work. The last auto session got stuck";
+pub(super) const AUTO_INACTIVITY_TIMEOUT_OPTIONS: &[(Option<u16>, &str)] = &[
+    (None, "Off"),
+    (Some(15), "15 minutes"),
+    (Some(30), "30 minutes"),
+    (Some(60), "60 minutes"),
+    (Some(120), "120 minutes"),
+];
 const AUTO_COMPLETION_CELEBRATION_DURATION: Duration = Duration::from_secs(5);
 const HISTORY_ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const AUTO_BOOTSTRAP_GOAL_PLACEHOLDER: &str = "Deriving goal from recent conversation";
@@ -823,7 +829,7 @@ use ratatui_image::picker::Picker;
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::task;
+use tokio::task::{self, JoinHandle};
 use uuid::Uuid;
 
 fn history_cell_logging_enabled() -> bool {
@@ -1267,6 +1273,23 @@ impl PendingAgentUpdate {
     fn key(&self) -> String { format!("{}:{}", self.cfg.name.to_ascii_lowercase(), self.id) }
 }
 
+struct AutoInactivityWatch {
+    token: u64,
+    handle: JoinHandle<()>,
+}
+
+impl AutoInactivityWatch {
+    fn abort(self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for AutoInactivityWatch {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 pub(crate) struct ChatWidget<'a> {
     app_event_tx: AppEventSender,
     code_op_tx: UnboundedSender<Op>,
@@ -1381,9 +1404,6 @@ pub(crate) struct ChatWidget<'a> {
     // Limits overlay state
     limits: LimitsState,
 
-    // Task manager overlay state
-    task_manager: TaskManagerState,
-
     // Active sudo password prompt overlay
     sudo_prompt: Option<SudoPromptState>,
 
@@ -1459,6 +1479,8 @@ pub(crate) struct ChatWidget<'a> {
     auto_turn_review_state: Option<AutoTurnReviewState>,
     auto_pending_goal_request: bool,
     auto_goal_bootstrap_done: bool,
+    auto_inactivity_watch: Option<AutoInactivityWatch>,
+    auto_inactivity_watch_token: u64,
     cloud_tasks_selected_env: Option<CloudEnvironment>,
     cloud_tasks_environments: Vec<CloudEnvironment>,
     cloud_tasks_last_tasks: Vec<TaskSummary>,
@@ -2056,6 +2078,7 @@ use self::settings_overlay::{
     AutoDriveSettingsContent,
     AgentsSettingsContent,
     GlobalUsageSettingsContent,
+    MiscSettingsContent,
     GithubSettingsContent,
     LimitsSettingsContent,
     ChromeSettingsContent,
@@ -2187,6 +2210,7 @@ fn wait_target_from_params(params: Option<&String>, call_id: &str) -> String {
                 return format!("call {}", cid);
             }
         }
+
     }
     format!("call {}", call_id)
 }
@@ -4015,10 +4039,11 @@ impl ChatWidget<'_> {
     }
 
     fn handle_sudo_password_request(&mut self, event: SudoPasswordRequestEvent) {
-        self.finalize_active_stream();
-        self.flush_interrupt_queue();
-        self.sudo_prompt = Some(SudoPromptState::new(event));
-        self.request_redraw();
+        tracing::warn!(
+            attempt = event.attempt,
+            message = ?event.message,
+            "Ignoring SudoPasswordRequest; sudo prompt UI disabled in this build"
+        );
     }
 
     fn handle_sudo_prompt_key(&mut self, key: KeyEvent) -> bool {
@@ -5170,7 +5195,6 @@ impl ChatWidget<'_> {
             },
             settings: SettingsState::default(),
             limits: LimitsState::default(),
-            task_manager: TaskManagerState::default(),
             sudo_prompt: None,
             global_usage: GlobalUsageState::default(),
             terminal: TerminalState::default(),
@@ -5229,6 +5253,8 @@ impl ChatWidget<'_> {
             auto_turn_review_state: None,
             auto_pending_goal_request: false,
             auto_goal_bootstrap_done: false,
+            auto_inactivity_watch: None,
+            auto_inactivity_watch_token: 0,
             cloud_tasks_selected_env: None,
             cloud_tasks_environments: Vec::new(),
             cloud_tasks_last_tasks: Vec::new(),
@@ -5501,7 +5527,6 @@ impl ChatWidget<'_> {
             },
             settings: SettingsState::default(),
             limits: LimitsState::default(),
-            task_manager: TaskManagerState::default(),
             sudo_prompt: None,
             global_usage: GlobalUsageState::default(),
             terminal: TerminalState::default(),
@@ -5560,6 +5585,8 @@ impl ChatWidget<'_> {
             auto_turn_review_state: None,
             auto_pending_goal_request: false,
             auto_goal_bootstrap_done: false,
+            auto_inactivity_watch: None,
+            auto_inactivity_watch_token: 0,
             cloud_tasks_selected_env: None,
             cloud_tasks_environments: Vec::new(),
             cloud_tasks_last_tasks: Vec::new(),
@@ -6257,9 +6284,6 @@ impl ChatWidget<'_> {
             return;
         }
         if self.handle_sudo_prompt_key(key_event) {
-            return;
-        }
-        if task_manager::handle_key(self, key_event) {
             return;
         }
         if self.browser_overlay_visible {
@@ -12464,8 +12488,8 @@ impl ChatWidget<'_> {
                 };
                 self.apply_plan_terminal_title(desired_title);
             }
-            EventMsg::RunningTasksSnapshot(ev) => {
-                task_manager::handle_running_tasks_snapshot(self, ev);
+            EventMsg::RunningTasksSnapshot(_) => {
+                tracing::debug!("Received RunningTasksSnapshot event; task manager UI disabled in this build");
             }
             EventMsg::ExecApprovalRequest(ev) => {
                 let id2 = id.clone();
@@ -14652,9 +14676,7 @@ impl ChatWidget<'_> {
             ));
             return;
         }
-        self.task_manager.begin_refresh();
-        self.request_running_tasks_snapshot();
-        self.mark_needs_redraw();
+        self.push_background_tail("Task manager is temporarily unavailable in this build.");
     }
 
     pub(crate) fn handle_login_command(&mut self) {
@@ -16210,6 +16232,132 @@ fi\n\
         self.request_redraw();
     }
 
+    pub(crate) fn set_auto_drive_inactivity_timeout(&mut self, minutes: Option<u16>) {
+        if self.config.auto_drive.inactivity_timeout_minutes == minutes {
+            self.auto_refresh_inactivity_watch();
+            return;
+        }
+
+        self.config.auto_drive.inactivity_timeout_minutes = minutes;
+
+        if let Ok(home) = code_core::config::find_code_home() {
+            if let Err(err) = code_core::config::set_auto_drive_settings(&home, &self.config.auto_drive)
+            {
+                tracing::warn!("Failed to persist Auto Drive settings: {err}");
+            }
+        } else {
+            tracing::warn!("Could not locate config home to persist Auto Drive settings");
+        }
+
+        let notice = match minutes {
+            Some(value) if value > 0 => {
+                format!("Auto Drive inactivity timeout set to {value} minutes.")
+            }
+            _ => "Auto Drive inactivity timeout disabled.".to_string(),
+        };
+
+        self.push_background_tail(notice);
+        if let Some(overlay) = self.settings.overlay.as_mut() {
+            if let Some(content) = overlay.misc_content_mut() {
+                content.set_current_timeout(minutes);
+            }
+        }
+        self.refresh_settings_overview_rows();
+        self.auto_refresh_inactivity_watch();
+        self.request_redraw();
+    }
+
+    fn inactivity_duration_from_minutes(minutes: Option<u16>) -> Option<Duration> {
+        minutes.and_then(|mins| {
+            if mins == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(u64::from(mins) * 60))
+            }
+        })
+    }
+
+    fn auto_inactivity_watch_allowed(&self) -> bool {
+        self.auto_state.is_active()
+            && !self.auto_state.awaiting_review()
+            && !self.auto_state.is_paused_manual()
+            && self.auto_state.goal.is_some()
+    }
+
+    fn auto_refresh_inactivity_watch(&mut self) {
+        let duration = Self::inactivity_duration_from_minutes(
+            self.config.auto_drive.inactivity_timeout_minutes,
+        );
+        if duration.is_none() || !self.auto_inactivity_watch_allowed() {
+            self.auto_cancel_inactivity_watch();
+            return;
+        }
+        if let Some(duration) = duration {
+            self.auto_schedule_inactivity_watch(duration);
+        }
+    }
+
+    fn auto_schedule_inactivity_watch(&mut self, duration: Duration) {
+        if duration.is_zero() {
+            self.auto_cancel_inactivity_watch();
+            return;
+        }
+
+        self.auto_inactivity_watch_token = self.auto_inactivity_watch_token.wrapping_add(1);
+        if let Some(watch) = self.auto_inactivity_watch.take() {
+            watch.abort();
+        }
+
+        let token = self.auto_inactivity_watch_token;
+        let tx = self.app_event_tx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            tx.send(AppEvent::AutoInactivityTimeout { token });
+        });
+        self.auto_inactivity_watch = Some(AutoInactivityWatch { token, handle });
+    }
+
+    fn auto_cancel_inactivity_watch(&mut self) {
+        if let Some(watch) = self.auto_inactivity_watch.take() {
+            watch.abort();
+        }
+    }
+
+    fn auto_mark_inactivity_progress(&mut self) {
+        self.auto_refresh_inactivity_watch();
+    }
+
+    pub(crate) fn auto_handle_inactivity_timeout(&mut self, token: u64) {
+        let should_handle = self
+            .auto_inactivity_watch
+            .as_ref()
+            .is_some_and(|watch| watch.token == token);
+        if !should_handle {
+            return;
+        }
+
+        self.auto_inactivity_watch.take();
+        if !self.auto_inactivity_watch_allowed() {
+            return;
+        }
+        if !self.auto_state.is_active() {
+            return;
+        }
+
+        if let Some(minutes) = self.config.auto_drive.inactivity_timeout_minutes {
+            if minutes > 0 {
+                self.push_background_tail(format!(
+                    "Auto Drive was idle for {} minutes. Restarting automatically.",
+                    minutes
+                ));
+            }
+        }
+
+        let resume_prompt = AUTO_INACTIVITY_RESUME_PROMPT.to_string();
+        self.auto_stop(Some(resume_prompt.clone()));
+        self.handle_auto_command(Some(resume_prompt));
+    }
+
     fn auto_send_conversation(&mut self) {
         if !self.auto_state.is_active() || self.auto_state.is_waiting_for_response() {
             return;
@@ -16584,6 +16732,8 @@ Have we met every part of this goal and is there no further work to do?"#
                 return;
             }
         }
+
+        self.auto_mark_inactivity_progress();
     }
 
     pub(crate) fn auto_handle_user_reply(
@@ -16618,6 +16768,7 @@ Have we met every part of this goal and is there no further work to do?"#
 
         self.auto_rebuild_live_ring();
         self.request_redraw();
+        self.auto_mark_inactivity_progress();
     }
 
     pub(crate) fn auto_handle_token_metrics(
@@ -16637,6 +16788,7 @@ Have we met every part of this goal and is there no further work to do?"#
                 replay_updates,
             );
         self.request_redraw();
+        self.auto_mark_inactivity_progress();
     }
 
     fn auto_session_tokens(&self) -> Option<u64> {
@@ -16826,6 +16978,7 @@ Have we met every part of this goal and is there no further work to do?"#
                 }
             }
         }
+        self.auto_refresh_inactivity_watch();
     }
 
     fn auto_spawn_countdown(&self, countdown_id: u64, decision_seq: u64, seconds: u8) {
@@ -16949,6 +17102,9 @@ Have we met every part of this goal and is there no further work to do?"#
             return;
         }
         self.auto_on_reasoning_delta(&delta, summary_index);
+        if !delta.trim().is_empty() {
+            self.auto_mark_inactivity_progress();
+        }
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -17424,6 +17580,7 @@ Have we met every part of this goal and is there no further work to do?"#
         self.next_cli_text_format = None;
         self.auto_pending_goal_request = false;
         self.auto_goal_bootstrap_done = false;
+        self.auto_cancel_inactivity_watch();
         let effects = self
             .auto_state
             .stop_run(Instant::now(), message);
@@ -20303,6 +20460,7 @@ Have we met every part of this goal and is there no further work to do?"#
         overlay.set_limits_content(self.build_limits_settings_content());
         overlay.set_chrome_content(self.build_chrome_settings_content(None));
         overlay.set_global_usage_content(self.build_global_usage_settings_content());
+        overlay.set_misc_content(self.build_misc_settings_content());
         let overview_rows = self.build_settings_overview_rows();
         overlay.set_overview_rows(overview_rows);
 
@@ -20388,6 +20546,13 @@ Have we met every part of this goal and is there no further work to do?"#
 
     fn build_notifications_settings_content(&mut self) -> NotificationsSettingsContent {
         NotificationsSettingsContent::new(self.build_notifications_settings_view())
+    }
+
+    fn build_misc_settings_content(&self) -> MiscSettingsContent {
+        MiscSettingsContent::new(
+            self.config.auto_drive.inactivity_timeout_minutes,
+            self.app_event_tx.clone(),
+        )
     }
 
     fn build_chrome_settings_content(&self, port: Option<u16>) -> ChromeSettingsContent {
@@ -20680,6 +20845,7 @@ Have we met every part of this goal and is there no further work to do?"#
                     SettingsSection::Mcp => self.settings_summary_mcp(),
                     SettingsSection::Notifications => self.settings_summary_notifications(),
                     SettingsSection::GlobalUsage => self.settings_summary_global_usage(),
+                    SettingsSection::Misc => self.settings_summary_misc(),
                 };
                 SettingsOverviewRow::new(section, summary)
             })
@@ -20871,6 +21037,14 @@ Have we met every part of this goal and is there no further work to do?"#
         }
     }
 
+    fn settings_summary_misc(&self) -> Option<String> {
+        let label = match self.config.auto_drive.inactivity_timeout_minutes {
+            Some(0) | None => "Auto inactivity timeout: Off".to_string(),
+            Some(minutes) => format!("Auto inactivity timeout: {} min", minutes),
+        };
+        Some(label)
+    }
+
     fn refresh_settings_overview_rows(&mut self) {
         if self.settings.overlay.is_none() {
             return;
@@ -21014,7 +21188,8 @@ Have we met every part of this goal and is there no further work to do?"#
             | SettingsSection::AutoDrive
             | SettingsSection::Mcp
             | SettingsSection::Notifications
-            | SettingsSection::GlobalUsage => false,
+            | SettingsSection::GlobalUsage
+            | SettingsSection::Misc => false,
             SettingsSection::Agents => {
                 self.show_agents_overview_ui();
                 false
@@ -21414,11 +21589,6 @@ Have we met every part of this goal and is there no further work to do?"#
     pub(crate) fn on_ctrl_c(&mut self) -> CancellationEvent {
         if self.sudo_prompt.is_some() {
             self.cancel_sudo_prompt();
-            return CancellationEvent::Handled;
-        }
-        if self.task_manager.is_visible() {
-            self.task_manager.close();
-            self.request_redraw();
             return CancellationEvent::Handled;
         }
         if let Some(id) = self.terminal_overlay_id() {
@@ -21823,7 +21993,6 @@ Have we met every part of this goal and is there no further work to do?"#
             || self.diffs.overlay.is_some()
             || self.help.overlay.is_some()
             || self.terminal.overlay.is_some()
-            || self.task_manager.is_visible()
             || self.sudo_prompt.is_some()
     }
 
@@ -34033,9 +34202,7 @@ impl WidgetRef for &ChatWidget<'_> {
                 }
             }
 
-            if self.task_manager.is_visible() {
-                task_manager::render_task_manager_overlay(self, area, history_area, buf);
-            } else if self.settings.overlay.is_none() {
+            if self.settings.overlay.is_none() {
                 if let Some(overlay) = &self.help.overlay {
                     // Global scrim across widget
                     let scrim_bg = Style::default()
@@ -34430,6 +34597,7 @@ struct SudoPromptState {
 }
 
 impl SudoPromptState {
+    #[allow(dead_code)]
     fn new(event: SudoPasswordRequestEvent) -> Self {
         Self {
             call_id: event.call_id,
