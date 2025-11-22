@@ -28,6 +28,7 @@ use crate::bottom_pane::{
 use crate::chrome_launch::{ChromeLaunchOption, CHROME_LAUNCH_CHOICES};
 use super::limits_overlay::{LimitsOverlay, LimitsOverlayContent};
 use super::{GlobalUsageState, GlobalUsageStatus, AUTO_INACTIVITY_TIMEOUT_OPTIONS};
+use code_core::config::EngineMode;
 use code_core::global_usage_tracker::{GlobalUsageSnapshot, UsageBucket, UsageTotals};
 use code_protocol::num_format::format_with_separators;
 use std::cell::Cell;
@@ -393,12 +394,32 @@ pub(crate) struct MiscSettingsContent {
 }
 
 impl MiscSettingsContent {
-    pub(crate) fn new(current_timeout: Option<u16>, app_event_tx: AppEventSender) -> Self {
-        Self { view: MiscSettingsView::new(current_timeout, app_event_tx) }
+    pub(crate) fn new(
+        current_session_engine: String,
+        preferred_engine: EngineMode,
+        current_timeout: Option<u16>,
+        app_event_tx: AppEventSender,
+    ) -> Self {
+        Self {
+            view: MiscSettingsView::new(
+                current_session_engine,
+                preferred_engine,
+                current_timeout,
+                app_event_tx,
+            ),
+        }
     }
 
     pub(crate) fn set_current_timeout(&mut self, minutes: Option<u16>) {
         self.view.set_current_timeout(minutes);
+    }
+
+    pub(crate) fn set_core_engine_label(&mut self, label: String) {
+        self.view.set_core_engine_label(label);
+    }
+
+    pub(crate) fn set_preferred_engine_mode(&mut self, mode: EngineMode) {
+        self.view.set_preferred_engine_mode(mode);
     }
 }
 
@@ -417,19 +438,53 @@ impl SettingsContent for MiscSettingsContent {
 }
 
 #[derive(Clone)]
+struct EngineOption {
+    mode: EngineMode,
+    label: &'static str,
+}
+
+const ENGINE_OPTIONS: [EngineOption; 2] = [
+    EngineOption {
+        mode: EngineMode::Kotlin,
+        label: "Kotlin",
+    },
+    EngineOption {
+        mode: EngineMode::Rust,
+        label: "Rust",
+    },
+];
+
 struct MiscSettingsView {
-    selected: usize,
+    selected_timeout: usize,
     current_timeout: Option<u16>,
     app_event_tx: AppEventSender,
+    current_session_engine: String,
+    preferred_engine: EngineMode,
+    engine_selected: usize,
+    engine_focus: bool,
 }
 
 impl MiscSettingsView {
-    fn new(current_timeout: Option<u16>, app_event_tx: AppEventSender) -> Self {
-        let selected = AUTO_INACTIVITY_TIMEOUT_OPTIONS
+    fn new(
+        current_session_engine: String,
+        preferred_engine: EngineMode,
+        current_timeout: Option<u16>,
+        app_event_tx: AppEventSender,
+    ) -> Self {
+        let selected_timeout = AUTO_INACTIVITY_TIMEOUT_OPTIONS
             .iter()
             .position(|(minutes, _)| *minutes == current_timeout)
             .unwrap_or(0);
-        Self { selected, current_timeout, app_event_tx }
+        let engine_selected = Self::engine_index(preferred_engine);
+        Self {
+            selected_timeout,
+            current_timeout,
+            app_event_tx,
+            current_session_engine,
+            preferred_engine,
+            engine_selected,
+            engine_focus: false,
+        }
     }
 
     fn set_current_timeout(&mut self, minutes: Option<u16>) {
@@ -438,45 +493,97 @@ impl MiscSettingsView {
             .iter()
             .position(|(option_minutes, _)| *option_minutes == minutes)
         {
-            self.selected = idx;
+            self.selected_timeout = idx;
         }
+    }
+
+    fn set_core_engine_label(&mut self, label: String) {
+        self.current_session_engine = label;
+    }
+
+    fn set_preferred_engine_mode(&mut self, mode: EngineMode) {
+        self.preferred_engine = mode;
+        self.engine_selected = Self::engine_index(mode);
+    }
+
+    fn engine_index(mode: EngineMode) -> usize {
+        ENGINE_OPTIONS
+            .iter()
+            .position(|option| option.mode == mode)
+            .unwrap_or(0)
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Up => {
-                if self.selected == 0 {
-                    self.selected = AUTO_INACTIVITY_TIMEOUT_OPTIONS.len().saturating_sub(1);
+            KeyCode::Left if self.engine_focus => {
+                if self.engine_selected == 0 {
+                    self.engine_selected = ENGINE_OPTIONS.len().saturating_sub(1);
                 } else {
-                    self.selected = self.selected.saturating_sub(1);
+                    self.engine_selected = self.engine_selected.saturating_sub(1);
+                }
+                true
+            }
+            KeyCode::Right if self.engine_focus => {
+                self.engine_selected = (self.engine_selected + 1) % ENGINE_OPTIONS.len();
+                true
+            }
+            KeyCode::Up => {
+                if self.engine_focus {
+                    self.engine_focus = false;
+                    self.selected_timeout = AUTO_INACTIVITY_TIMEOUT_OPTIONS.len().saturating_sub(1);
+                } else if self.selected_timeout == 0 {
+                    self.engine_focus = true;
+                } else {
+                    self.selected_timeout = self.selected_timeout.saturating_sub(1);
                 }
                 true
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1) % AUTO_INACTIVITY_TIMEOUT_OPTIONS.len();
+                if self.engine_focus {
+                    self.engine_focus = false;
+                    self.selected_timeout = 0;
+                } else if self.selected_timeout + 1 >= AUTO_INACTIVITY_TIMEOUT_OPTIONS.len() {
+                    self.engine_focus = true;
+                } else {
+                    self.selected_timeout = self.selected_timeout.saturating_add(1);
+                }
                 true
             }
             KeyCode::Home => {
-                self.selected = 0;
+                self.engine_focus = false;
+                self.selected_timeout = 0;
                 true
             }
             KeyCode::End => {
-                self.selected = AUTO_INACTIVITY_TIMEOUT_OPTIONS.len().saturating_sub(1);
+                self.engine_focus = false;
+                self.selected_timeout = AUTO_INACTIVITY_TIMEOUT_OPTIONS.len().saturating_sub(1);
                 true
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
-                self.apply_selection();
+                if self.engine_focus {
+                    self.apply_engine_selection();
+                } else {
+                    self.apply_timeout_selection();
+                }
                 true
             }
             _ => false,
         }
     }
 
-    fn apply_selection(&mut self) {
-        if let Some(&(minutes, _)) = AUTO_INACTIVITY_TIMEOUT_OPTIONS.get(self.selected) {
+    fn apply_timeout_selection(&mut self) {
+        if let Some(&(minutes, _)) = AUTO_INACTIVITY_TIMEOUT_OPTIONS.get(self.selected_timeout) {
             self.current_timeout = minutes;
             self.app_event_tx
                 .send(AppEvent::UpdateAutoDriveTimeout { minutes });
+        }
+    }
+
+    fn apply_engine_selection(&mut self) {
+        if let Some(option) = ENGINE_OPTIONS.get(self.engine_selected) {
+            self.preferred_engine = option.mode;
+            self.app_event_tx
+                .send(AppEvent::UpdateEngineMode { mode: option.mode });
         }
     }
 
@@ -485,26 +592,81 @@ impl MiscSettingsView {
             return;
         }
 
-        let chunks: [Rect; 3] = Layout::vertical([
+        let engine_rows = ENGINE_OPTIONS.len().max(1) as u16;
+        let chunks: [Rect; 8] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(engine_rows),
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Min(AUTO_INACTIVITY_TIMEOUT_OPTIONS.len() as u16 * 2),
         ])
         .areas(area);
 
-        Paragraph::new("Auto Drive inactivity timeout")
+        Paragraph::new("Core engine")
             .style(Style::default().fg(crate::colors::text()).add_modifier(Modifier::BOLD))
             .render(chunks[0], buf);
 
-        let instructions = "Use ↑/↓ to choose an Auto Drive inactivity timeout · Enter applies the change";
-        Paragraph::new(instructions)
+        Paragraph::new(format!("Current session: {}", self.current_session_engine))
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(crate::colors::text_dim()))
             .render(chunks[1], buf);
 
+        Paragraph::new("Default for future sessions")
+            .style(Style::default().fg(crate::colors::text()).add_modifier(Modifier::BOLD))
+            .render(chunks[2], buf);
+
+        let engine_instructions =
+            "Use ←/→ to choose Kotlin or Rust · Enter saves · Environment overrides still win";
+        Paragraph::new(engine_instructions)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(crate::colors::text_dim()))
+            .render(chunks[3], buf);
+
+        let engine_lines: Vec<Line<'static>> = ENGINE_OPTIONS
+            .iter()
+            .enumerate()
+            .map(|(idx, option)| {
+                let indicator = if self.engine_focus && self.engine_selected == idx {
+                    '›'
+                } else {
+                    ' '
+                };
+                let active = if self.preferred_engine == option.mode { '●' } else { '○' };
+                Line::from(vec![
+                    Span::styled(indicator.to_string(), Style::default().fg(crate::colors::text_dim())),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{} {}", active, option.label),
+                        Style::default().fg(crate::colors::text()),
+                    ),
+                ])
+            })
+            .collect();
+        Paragraph::new(engine_lines)
+            .wrap(Wrap { trim: true })
+            .render(chunks[4], buf);
+
+        Paragraph::new("Auto Drive inactivity timeout")
+            .style(Style::default().fg(crate::colors::text()).add_modifier(Modifier::BOLD))
+            .render(chunks[5], buf);
+
+        let timeout_instructions =
+            "Use ↑/↓ to choose an Auto Drive inactivity timeout · Enter applies the change";
+        Paragraph::new(timeout_instructions)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(crate::colors::text_dim()))
+            .render(chunks[6], buf);
+
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (idx, (minutes, label)) in AUTO_INACTIVITY_TIMEOUT_OPTIONS.iter().enumerate() {
-            let indicator = if idx == self.selected { '›' } else { ' ' };
+            let indicator = if !self.engine_focus && idx == self.selected_timeout {
+                '›'
+            } else {
+                ' '
+            };
             let active = if self.current_timeout == *minutes { '●' } else { '○' };
             let spans = vec![
                 Span::styled(indicator.to_string(), Style::default().fg(crate::colors::text_dim())),
@@ -527,7 +689,7 @@ impl MiscSettingsView {
 
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .render(chunks[2], buf);
+            .render(chunks[7], buf);
     }
 
     fn option_description(minutes: Option<u16>) -> &'static str {

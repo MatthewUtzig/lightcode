@@ -11,12 +11,18 @@ mod retry;
 mod faults;
 
 pub use auto_coordinator::{
+    filter_popular_commands,
+    build_initial_planning_seed,
+    InitialPlanningSeed,
     start_auto_coordinator,
     AutoCoordinatorCommand,
     AutoCoordinatorEvent,
     AutoCoordinatorEventSender,
     AutoCoordinatorHandle,
+    AutoCoordinatorRuntime,
+    AutoCoordinatorSpawnOptions,
     AutoCoordinatorStatus,
+    RustAutoCoordinatorRuntime,
     AutoTurnAgentsAction,
     AutoTurnAgentsTiming,
     AutoTurnCliAction,

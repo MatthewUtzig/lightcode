@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::borrow::Cow;
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -49,8 +50,8 @@ use code_protocol::protocol::TurnAbortReason;
 use code_protocol::protocol::TurnAbortedEvent;
 use futures::prelude::*;
 use mcp_types::CallToolResult;
-use serde::Serialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tracing::debug;
@@ -66,8 +67,10 @@ use crate::agent_tool::AgentStatusUpdatePayload;
 use crate::split_command_and_args;
 use crate::git_worktree;
 use crate::protocol::ApprovedCommandMatchKind;
+use crate::protocol::AgentMessageEvent;
 use crate::protocol::WebSearchBeginEvent;
 use crate::protocol::WebSearchCompleteEvent;
+use crate::kotlin_host::{chat_turn_payload, run_kotlin_turn, KotlinCoreHost};
 use code_protocol::mcp_protocol::AuthMode;
 use crate::account_scheduler::{AccountScheduler, AccountSelection, SchedulerOutcome};
 use crate::account_usage;
@@ -843,7 +846,7 @@ use crate::environment_context::{
     ViewportDimensions,
 };
 use crate::user_instructions::UserInstructions;
-use crate::config::{persist_model_selection, Config};
+use crate::config::{persist_model_selection, Config, EngineMode};
 use crate::config_types::ProjectHookEvent;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::conversation_history::ConversationHistory;
@@ -881,16 +884,16 @@ use crate::plan_tool::handle_update_plan;
 use crate::project_doc::get_user_instructions;
 use crate::project_features::{ProjectCommand, ProjectHook, ProjectHooks};
 use crate::protocol::AgentMessageDeltaEvent;
-use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningDeltaEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::AgentReasoningRawContentDeltaEvent;
 use crate::protocol::AgentReasoningRawContentEvent;
 use crate::protocol::AgentReasoningSectionBreakEvent;
+use crate::protocol::AgentInfo;
 use crate::protocol::AgentStatusUpdateEvent;
+use crate::protocol::BackgroundEventEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
-use crate::protocol::BackgroundEventEvent;
 use crate::protocol::BrowserScreenshotUpdateEvent;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
@@ -936,7 +939,6 @@ use crate::user_notification::UserNotification;
 use crate::util::{backoff, strip_bash_lc_and_escape};
 use code_protocol::protocol::SessionSource;
 use crate::rollout::recorder::SessionStateSnapshot;
-use serde_json::Value;
 use crate::exec_command::ExecSessionManager;
 
 /// The high-level interface to the Codex system.
@@ -1343,6 +1345,7 @@ struct BackgroundExecState {
 pub(crate) struct Session {
     id: Uuid,
     client: ModelClient,
+    engine_mode: EngineMode,
     account_scheduler: Option<Arc<Mutex<AccountScheduler>>>,
     current_account_id: Mutex<Option<String>>,
     tx_event: Sender<Event>,
@@ -1366,6 +1369,7 @@ pub(crate) struct Session {
     client_tools: Option<ClientTools>,
     #[allow(dead_code)]
     session_manager: ExecSessionManager,
+    kotlin_engine: Mutex<Option<KotlinCoreHost>>,
 
     /// Configuration for available agent models
     agents: Vec<crate::config_types::AgentConfig>,
@@ -1442,6 +1446,23 @@ impl ToolCallCtx {
 impl Session {
     pub(crate) fn account_scheduler(&self) -> Option<Arc<Mutex<AccountScheduler>>> {
         self.account_scheduler.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn engine_mode(&self) -> EngineMode {
+        self.engine_mode
+    }
+
+    fn run_kotlin_sequence(&self, payload: Value) -> anyhow::Result<Vec<crate::kotlin_host::EngineEvent>> {
+        if !matches!(self.engine_mode, EngineMode::Kotlin) {
+            return Err(anyhow!("kotlin engine disabled"));
+        }
+        let mut guard = self.kotlin_engine.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(KotlinCoreHost::new()?);
+        }
+        let host = guard.as_mut().expect("host initialized");
+        host.submit_json(&payload)?;
+        host.poll_events()
     }
 
     pub(crate) fn set_current_account_id(&self, account_id: Option<String>) {
@@ -4300,6 +4321,44 @@ async fn submission_loop(
                     sess.abort();
                 });
             }
+            Op::KotlinTurn { prompt } => {
+                if matches!(config.engine_mode, EngineMode::Kotlin) {
+                    match run_kotlin_turn(&prompt) {
+                        Ok(messages) => {
+                            for (idx, message) in messages.into_iter().enumerate() {
+                                let event = Event {
+                                    id: sub.id.clone(),
+                                    event_seq: idx as u64,
+                                    msg: EventMsg::AgentMessage(AgentMessageEvent { message }),
+                                    order: None,
+                                };
+                                let _ = tx_event.send(event).await;
+                            }
+                        }
+                        Err(err) => {
+                            let event = Event {
+                                id: sub.id.clone(),
+                                event_seq: 0,
+                                msg: EventMsg::Error(ErrorEvent {
+                                    message: format!("Kotlin engine error: {err:#}"),
+                                }),
+                                order: None,
+                            };
+                            let _ = tx_event.send(event).await;
+                        }
+                    }
+                } else {
+                    let event = Event {
+                        id: sub.id.clone(),
+                        event_seq: 0,
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: "Set CODE_ENGINE=kotlin to enable the Kotlin engine".to_string(),
+                        }),
+                        order: None,
+                    };
+                    let _ = tx_event.send(event).await;
+                }
+            }
             Op::ListRunningTasks => {
                 let sess_arc = match sess.as_ref() {
                     Some(sess) => Arc::clone(sess),
@@ -4766,6 +4825,7 @@ async fn submission_loop(
                 let mut new_session = Arc::new(Session {
                     id: session_id,
                     client,
+                    engine_mode: config.engine_mode,
                     account_scheduler: Some(Arc::clone(&account_scheduler)),
                     current_account_id: Mutex::new(current_account_id.clone()),
                     tools_config,
@@ -4781,6 +4841,7 @@ async fn submission_loop(
             mcp_connection_manager,
             client_tools: config.experimental_client_tools.clone(),
             session_manager: crate::exec_command::ExecSessionManager::default(),
+            kotlin_engine: Mutex::new(None),
                     agents: config.agents.clone(),
                     notify,
                     state: Mutex::new(state),
@@ -4846,6 +4907,7 @@ async fn submission_loop(
                     EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id,
                         model,
+                        engine_mode: sess_arc.engine_mode().as_str().to_string(),
                         history_log_id,
                         history_entry_count,
                     }),
@@ -4886,6 +4948,18 @@ async fn submission_loop(
                     );
                     if let Err(e) = tx_event.send(event).await {
                         warn!("failed to send resume notice event: {e}");
+                    }
+                }
+
+                if matches!(config.engine_mode, EngineMode::Kotlin) {
+                    let event = sess_arc.make_event(
+                        &sub.id,
+                        EventMsg::BackgroundEvent(BackgroundEventEvent {
+                            message: "Experimental Kotlin engine enabled for this session.".to_string(),
+                        }),
+                    );
+                    if let Err(e) = tx_event.send(event).await {
+                        warn!("failed to send Kotlin engine notice: {e}");
                     }
                 }
 
@@ -5762,6 +5836,15 @@ async fn run_turn(
     pending_input_tail: Vec<ResponseItem>,
     mut input: Vec<ResponseItem>,
 ) -> CodexResult<Vec<ProcessedResponseItem>> {
+    if matches!(sess.engine_mode(), EngineMode::Kotlin) && turn_input_is_tool_free_chat(&input) {
+        match run_kotlin_engine_turn(sess, turn_diff_tracker, &sub_id, &input).await {
+            Ok(output) => return Ok(output),
+            Err(err) => {
+                warn!("Kotlin simple turn failed, falling back to Rust path: {err:#}");
+            }
+        }
+    }
+
     // Check if browser is enabled
     let browser_enabled = code_browser::global::get_browser_manager().await.is_some();
 
@@ -6088,6 +6171,12 @@ async fn run_turn(
     }
 }
 
+fn turn_input_is_tool_free_chat(items: &[ResponseItem]) -> bool {
+    items
+        .iter()
+        .all(|item| matches!(item, ResponseItem::Message { .. } | ResponseItem::Reasoning { .. }))
+}
+
 fn select_scheduler_account(handle: &Arc<Mutex<AccountScheduler>>) -> Option<AccountSelection> {
     let mut scheduler = handle.lock().unwrap();
     scheduler.next_account(None, Utc::now())
@@ -6258,6 +6347,391 @@ impl Drop for TurnLatencyGuard<'_> {
         }
     }
 }
+
+async fn run_kotlin_engine_turn(
+    sess: &Arc<Session>,
+    turn_diff_tracker: &mut TurnDiffTracker,
+    sub_id: &str,
+    turn_input: &[ResponseItem],
+) -> CodexResult<Vec<ProcessedResponseItem>> {
+    sess.begin_http_attempt();
+    let attempt_req = sess.current_request_ordinal();
+    let history_items = {
+        let state = sess.state.lock().unwrap();
+        state.history.contents()
+    };
+    let payload = chat_turn_payload(&history_items, turn_input)
+        .map_err(|err| CodexErr::UnsupportedOperation(format!("Failed to encode Kotlin chat turn: {err:#}")))?;
+    let events = sess
+        .run_kotlin_sequence(payload)
+        .map_err(|err| CodexErr::UnsupportedOperation(format!("Kotlin engine error: {err:#}")))?;
+
+    let mut texts = Vec::new();
+    let mut stream_seq: u64 = 0;
+    for event in events {
+        match event.kind.as_str() {
+            "agent_message" => {
+                if let Some(text) = event.payload.get("message").and_then(|v| v.as_str()) {
+                    emit_kotlin_agent_message_delta(
+                        sess,
+                        sub_id,
+                        attempt_req,
+                        stream_seq,
+                        text,
+                    )
+                    .await;
+                    emit_kotlin_agent_message_final(
+                        sess,
+                        sub_id,
+                        attempt_req,
+                        stream_seq,
+                        text,
+                    )
+                    .await;
+                    stream_seq = stream_seq.saturating_add(1);
+                    texts.push(text.to_string());
+                }
+            }
+            "auto_drive_step" => {
+                if let Ok(payload) = serde_json::from_value::<KotlinStepEventPayload>(event.payload) {
+                    emit_kotlin_step_background(sess, sub_id, payload, turn_diff_tracker, attempt_req).await;
+                }
+            }
+            "auto_drive_status" => {
+                if let Ok(payload) = serde_json::from_value::<KotlinStatusEventPayload>(event.payload) {
+                    emit_kotlin_status_update(sess, sub_id, payload).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let texts = if texts.is_empty() {
+        vec!["Kotlin engine did not emit any events.".to_string()]
+    } else {
+        texts
+    };
+
+    let processed = texts
+        .into_iter()
+        .map(|text| ProcessedResponseItem {
+            item: ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText { text }],
+            },
+            response: None,
+        })
+        .collect();
+    Ok(processed)
+}
+
+#[derive(Deserialize, Serialize)]
+struct KotlinStepEventPayload {
+    step_index: u64,
+    total_steps: u64,
+    phase: String,
+    continue_mode: Option<String>,
+    seconds_remaining: Option<u64>,
+    effects: Vec<KotlinEffectPayload>,
+    summary: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct KotlinStatusEventPayload {
+    status: String,
+    step_index: u64,
+    total_steps: u64,
+    summary: Option<String>,
+    goal: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct KotlinEffectPayload {
+    #[serde(rename = "type")]
+    kind: String,
+    countdown_id: Option<u64>,
+    decision_seq: Option<u64>,
+    seconds: Option<u64>,
+    message: Option<String>,
+    running: Option<bool>,
+    hint: Option<String>,
+    attempt: Option<u64>,
+    delay_ms: Option<u64>,
+    reason: Option<String>,
+    token: Option<u64>,
+    turns_completed: Option<u64>,
+    duration_ms: Option<u64>,
+    #[serde(rename = "exec_request")]
+    exec_request: Option<KotlinExecRequestPayload>,
+    #[serde(rename = "patch_request")]
+    patch_request: Option<KotlinPatchRequestPayload>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct KotlinExecRequestPayload {
+    call_id: String,
+    command: Vec<String>,
+    cwd: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct KotlinPatchRequestPayload {
+    call_id: String,
+    changes: HashMap<String, KotlinPatchChangePayload>,
+    reason: Option<String>,
+    grant_root: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct KotlinPatchChangePayload {
+    kind: KotlinPatchChangeKind,
+    content: Option<String>,
+    unified_diff: Option<String>,
+    move_path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum KotlinPatchChangeKind {
+    Add,
+    Delete,
+    Update,
+}
+
+
+async fn emit_kotlin_step_background(
+    sess: &Arc<Session>,
+    sub_id: &str,
+    payload: KotlinStepEventPayload,
+    turn_diff_tracker: &mut TurnDiffTracker,
+    attempt_req: u64,
+) {
+    match serde_json::to_string(&payload) {
+        Ok(message) => {
+            let event = sess.make_event(
+                sub_id,
+                EventMsg::BackgroundEvent(BackgroundEventEvent { message }),
+            );
+            sess.send_event(event).await;
+        }
+        Err(err) => {
+            warn!("failed to serialize Kotlin step payload: {err}");
+        }
+    }
+
+    for effect in &payload.effects {
+        emit_kotlin_effect_summary(sess, sub_id, effect).await;
+        if let Some(exec_request) = effect.exec_request.clone() {
+            handle_kotlin_exec_request(sess, turn_diff_tracker, sub_id, exec_request, attempt_req).await;
+        }
+        if let Some(patch_request) = effect.patch_request.clone() {
+            handle_kotlin_patch_request(sess, turn_diff_tracker, sub_id, patch_request, attempt_req).await;
+        }
+    }
+}
+
+async fn emit_kotlin_effect_summary(
+    sess: &Arc<Session>,
+    sub_id: &str,
+    effect: &KotlinEffectPayload,
+) {
+    let mut pieces = vec![format!("effect={}", effect.kind)];
+    if let Some(id) = effect.countdown_id {
+        pieces.push(format!("countdown_id={id}"));
+    }
+    if let Some(seq) = effect.decision_seq {
+        pieces.push(format!("decision_seq={seq}"));
+    }
+    if let Some(seconds) = effect.seconds {
+        pieces.push(format!("seconds={seconds}"));
+    }
+    if let Some(delay) = effect.delay_ms {
+        pieces.push(format!("delay_ms={delay}"));
+    }
+    if let Some(attempt) = effect.attempt {
+        pieces.push(format!("attempt={attempt}"));
+    }
+    if let Some(running) = effect.running {
+        pieces.push(format!("running={running}"));
+    }
+    if let Some(token) = effect.token {
+        pieces.push(format!("token={token}"));
+    }
+    if let Some(turns) = effect.turns_completed {
+        pieces.push(format!("turns_completed={turns}"));
+    }
+    if let Some(duration) = effect.duration_ms {
+        pieces.push(format!("duration_ms={duration}"));
+    }
+    if let Some(reason) = &effect.reason {
+        pieces.push(format!("reason={reason}"));
+    }
+    if let Some(hint) = &effect.hint {
+        pieces.push(format!("hint={hint}"));
+    }
+    if let Some(message) = &effect.message {
+        pieces.push(format!("message={message}"));
+    }
+
+    let summary = format!("[Kotlin Auto Drive] {}", pieces.join(" "));
+    let event = sess.make_event(
+        sub_id,
+        EventMsg::BackgroundEvent(BackgroundEventEvent { message: summary }),
+    );
+    sess.send_event(event).await;
+
+}
+
+async fn emit_kotlin_status_update(
+    sess: &Arc<Session>,
+    sub_id: &str,
+    payload: KotlinStatusEventPayload,
+) {
+    let progress = payload
+        .summary
+        .clone()
+        .unwrap_or_else(|| format!("Step {} of {}", payload.step_index + 1, payload.total_steps));
+    let agent = AgentInfo {
+        id: "kotlin-auto-drive".to_string(),
+        name: "Kotlin Auto Drive".to_string(),
+        status: payload.status,
+        batch_id: None,
+        model: Some("core-kotlin".to_string()),
+        last_progress: Some(progress),
+        result: None,
+        error: None,
+        elapsed_ms: None,
+        token_count: None,
+    };
+    let event = sess.make_event(
+        sub_id,
+        EventMsg::AgentStatusUpdate(AgentStatusUpdateEvent {
+            agents: vec![agent],
+            context: None,
+            task: payload.goal,
+        }),
+    );
+    sess.send_event(event).await;
+}
+
+async fn handle_kotlin_exec_request(
+    sess: &Arc<Session>,
+    turn_diff_tracker: &mut TurnDiffTracker,
+    sub_id: &str,
+    payload: KotlinExecRequestPayload,
+    attempt_req: u64,
+) {
+    let params = ShellToolCallParams {
+        command: payload.command.clone(),
+        workdir: payload.cwd.clone(),
+        timeout_ms: None,
+        with_escalated_permissions: None,
+        justification: payload.reason.clone(),
+    };
+    let exec_params = to_exec_params(params, sess);
+    handle_container_exec_with_params(
+        exec_params,
+        sess,
+        turn_diff_tracker,
+        sub_id.to_string(),
+        payload.call_id.clone(),
+        None,
+        None,
+        attempt_req,
+    )
+    .await;
+}
+
+async fn handle_kotlin_patch_request(
+    sess: &Arc<Session>,
+    turn_diff_tracker: &mut TurnDiffTracker,
+    sub_id: &str,
+    payload: KotlinPatchRequestPayload,
+    attempt_req: u64,
+) {
+    let Some(action) = build_apply_patch_action_from_kotlin(sess, &payload) else {
+        return;
+    };
+
+    if let Some(branch_root) = git_worktree::branch_worktree_root(sess.get_cwd()) {
+        if let Some(guidance) = guard_apply_patch_outside_branch(&branch_root, &action) {
+            let order = sess.next_background_order(sub_id, attempt_req, None);
+            sess
+                .notify_background_event_with_order(
+                    sub_id,
+                    order,
+                    format!("Command guard: {}", guidance.clone()),
+                )
+                .await;
+            return;
+        }
+    }
+
+    let grant_root = payload
+        .grant_root
+        .as_ref()
+        .map(|value| resolve_path_against_cwd(sess.get_cwd(), value));
+
+    let _ = run_apply_patch_pipeline(
+        sess,
+        turn_diff_tracker,
+        sub_id.to_string(),
+        payload.call_id.clone(),
+        action,
+        None,
+        None,
+        attempt_req,
+        payload.reason.clone(),
+        grant_root,
+    )
+    .await;
+}
+
+fn build_apply_patch_action_from_kotlin(
+    sess: &Session,
+    payload: &KotlinPatchRequestPayload,
+) -> Option<ApplyPatchAction> {
+    let (path, change) = match payload.changes.iter().next() {
+        Some(entry) => (entry.0.clone(), entry.1.clone()),
+        None => {
+            warn!("Kotlin patch request missing changes (call_id={})", payload.call_id);
+            return None;
+        }
+    };
+    match change.kind {
+        KotlinPatchChangeKind::Add => {
+            let content = match change.content {
+                Some(value) => value,
+                None => {
+                    warn!("Kotlin patch add change missing content (call_id={})", payload.call_id);
+                    return None;
+                }
+            };
+            let abs_path = resolve_path_against_cwd(sess.get_cwd(), &path);
+            Some(ApplyPatchAction::new_add_for_test(&abs_path, content))
+        }
+        _ => {
+            warn!(
+                "unsupported Kotlin patch change kind {:?} (call_id={})",
+                change.kind,
+                payload.call_id
+            );
+            None
+        }
+    }
+}
+
+fn resolve_path_against_cwd(base: &Path, candidate: &str) -> PathBuf {
+    let path = PathBuf::from(candidate);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
 
 async fn try_run_turn(
     sess: &Session,
@@ -10460,86 +10934,19 @@ async fn handle_container_exec_with_params(
                     };
                 }
             }
-            let changes = convert_apply_patch_to_protocol(&action);
-            turn_diff_tracker.on_patch_begin(&changes);
-
-            match apply_patch::apply_patch(
+            return run_apply_patch_pipeline(
                 sess,
-                &sub_id,
-                &call_id,
-                attempt_req,
-                output_index,
+                turn_diff_tracker,
+                sub_id.to_string(),
+                call_id,
                 action,
+                seq_hint,
+                output_index,
+                attempt_req,
+                None,
+                None,
             )
-            .await
-            {
-                ApplyPatchResult::Reply(item) => return item,
-                ApplyPatchResult::Applied(run) => {
-                    let order_begin = crate::protocol::OrderMeta {
-                        request_ordinal: attempt_req,
-                        output_index,
-                        sequence_number: seq_hint,
-                    };
-                    let begin_event = EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
-                        call_id: call_id.clone(),
-                        auto_approved: run.auto_approved,
-                        changes,
-                    });
-                    let event = sess.make_event_with_order(&sub_id, begin_event, order_begin, seq_hint);
-                    let _ = sess.tx_event.send(event).await;
-
-                    let order_end = crate::protocol::OrderMeta {
-                        request_ordinal: attempt_req,
-                        output_index,
-                        sequence_number: seq_hint.map(|h| h.saturating_add(1)),
-                    };
-                    let end_event = EventMsg::PatchApplyEnd(PatchApplyEndEvent {
-                        call_id: call_id.clone(),
-                        stdout: run.stdout.clone(),
-                        stderr: run.stderr.clone(),
-                        success: run.success,
-                    });
-                    let event = sess.make_event_with_order(
-                        &sub_id,
-                        end_event,
-                        order_end,
-                        seq_hint.map(|h| h.saturating_add(1)),
-                    );
-                    let _ = sess.tx_event.send(event).await;
-
-                    if let Ok(Some(unified_diff)) = turn_diff_tracker.get_unified_diff() {
-                        let diff_event = sess.make_event(
-                            &sub_id,
-                            EventMsg::TurnDiff(TurnDiffEvent { unified_diff }),
-                        );
-                        let _ = sess.tx_event.send(diff_event).await;
-                    }
-
-                    let mut content = run.stdout;
-                    if !run.success && !run.stderr.is_empty() {
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
-                        content.push_str(&format!("stderr: {}", run.stderr));
-                    }
-                    if let Some(summary) = run.harness_summary_json {
-                        if !summary.is_empty() {
-                            if !content.is_empty() {
-                                content.push('\n');
-                            }
-                            content.push_str(&summary);
-                        }
-                    }
-
-                    return ResponseInputItem::FunctionCallOutput {
-                        call_id,
-                        output: FunctionCallOutputPayload {
-                            content,
-                            success: Some(run.success),
-                        },
-                    };
-                }
-            }
+            .await;
         }
         MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
             return ResponseInputItem::FunctionCallOutput {
@@ -10877,6 +11284,148 @@ async fn handle_container_exec_with_params(
         format!("{}\n\nOutput so far (tail):\n{}", header, tail)
     };
     ResponseInputItem::FunctionCallOutput { call_id: call_id.clone(), output: FunctionCallOutputPayload { content: msg, success: Some(true) } }
+}
+
+async fn run_apply_patch_pipeline(
+    sess: &Session,
+    turn_diff_tracker: &mut TurnDiffTracker,
+    sub_id: String,
+    call_id: String,
+    action: ApplyPatchAction,
+    seq_hint: Option<u64>,
+    output_index: Option<u32>,
+    attempt_req: u64,
+    reason: Option<String>,
+    grant_root: Option<PathBuf>,
+) -> ResponseInputItem {
+    let protocol_changes = convert_apply_patch_to_protocol(&action);
+    turn_diff_tracker.on_patch_begin(&protocol_changes);
+
+    match apply_patch::apply_patch(
+        sess,
+        &sub_id,
+        &call_id,
+        attempt_req,
+        output_index,
+        action,
+        reason,
+        grant_root,
+    )
+    .await
+    {
+        ApplyPatchResult::Reply(item) => item,
+        ApplyPatchResult::Applied(run) => {
+            let order_begin = crate::protocol::OrderMeta {
+                request_ordinal: attempt_req,
+                output_index,
+                sequence_number: seq_hint,
+            };
+            let begin_event = EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+                call_id: call_id.clone(),
+                auto_approved: run.auto_approved,
+                changes: protocol_changes.clone(),
+            });
+            let event = sess.make_event_with_order(&sub_id, begin_event, order_begin, seq_hint);
+            let _ = sess.tx_event.send(event).await;
+
+            let order_end = crate::protocol::OrderMeta {
+                request_ordinal: attempt_req,
+                output_index,
+                sequence_number: seq_hint.map(|hint| hint.saturating_add(1)),
+            };
+            let end_event = EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+                call_id: call_id.clone(),
+                stdout: run.stdout.clone(),
+                stderr: run.stderr.clone(),
+                success: run.success,
+            });
+            let event = sess.make_event_with_order(
+                &sub_id,
+                end_event,
+                order_end,
+                seq_hint.map(|hint| hint.saturating_add(1)),
+            );
+            let _ = sess.tx_event.send(event).await;
+
+            if let Ok(Some(unified_diff)) = turn_diff_tracker.get_unified_diff() {
+                let diff_event = sess.make_event(
+                    &sub_id,
+                    EventMsg::TurnDiff(TurnDiffEvent { unified_diff }),
+                );
+                let _ = sess.tx_event.send(diff_event).await;
+            }
+
+            let mut content = run.stdout.clone();
+            if !run.success && !run.stderr.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&format!("stderr: {}", run.stderr));
+            }
+            if let Some(summary) = run.harness_summary_json.as_ref() {
+                if !summary.is_empty() {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(summary);
+                }
+            }
+
+            ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content,
+                    success: Some(run.success),
+                },
+            }
+        }
+    }
+}
+
+async fn emit_kotlin_agent_message_delta(
+    sess: &Arc<Session>,
+    sub_id: &str,
+    attempt_req: u64,
+    sequence_number: u64,
+    text: &str,
+) {
+    let order = crate::protocol::OrderMeta {
+        request_ordinal: attempt_req,
+        output_index: Some(0),
+        sequence_number: Some(sequence_number),
+    };
+    let event = sess.make_event_with_order(
+        sub_id,
+        EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+            delta: text.to_string(),
+        }),
+        order,
+        Some(sequence_number),
+    );
+    let _ = sess.tx_event.send(event).await;
+}
+
+async fn emit_kotlin_agent_message_final(
+    sess: &Arc<Session>,
+    sub_id: &str,
+    attempt_req: u64,
+    sequence_number: u64,
+    text: &str,
+) {
+    let order = crate::protocol::OrderMeta {
+        request_ordinal: attempt_req,
+        output_index: Some(0),
+        sequence_number: Some(sequence_number),
+    };
+    let event = sess.make_event_with_order(
+        sub_id,
+        EventMsg::AgentMessage(AgentMessageEvent {
+            message: text.to_string(),
+        }),
+        order,
+        Some(sequence_number),
+    );
+    let _ = sess.tx_event.send(event).await;
 }
 
 #[allow(dead_code)]

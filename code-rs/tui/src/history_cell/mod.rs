@@ -2079,6 +2079,7 @@ pub(crate) fn new_session_info(
         session_id: _,
         history_log_id: _,
         history_entry_count: _,
+        engine_mode: _,
         ..
     } = event;
 

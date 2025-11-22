@@ -85,6 +85,22 @@ bin_requested() {
   return 1
 }
 
+run_kotlin_tests_if_needed() {
+  if [ "${WORKSPACE_DIR}" != "code-rs" ]; then
+    return
+  fi
+  if [ "${BUILD_FAST_SKIP_KOTLIN_TESTS:-0}" = "1" ]; then
+    echo "Skipping Kotlin core tests (BUILD_FAST_SKIP_KOTLIN_TESTS=1)"
+    return
+  fi
+  if [ ! -d "${REPO_ROOT}/core-kotlin" ]; then
+    echo "Skipping Kotlin core tests (core-kotlin directory missing)"
+    return
+  fi
+  echo "Running Kotlin core tests via scripts/run-core-kotlin-tests.sh"
+  (cd "${REPO_ROOT}" && ./scripts/run-core-kotlin-tests.sh)
+}
+
 resolve_bin_path() {
   case "$PROFILE" in
     dev-fast)
@@ -673,6 +689,8 @@ if [ $? -eq 0 ]; then
     echo "✅ Build successful!"
     echo "Binary location: ${BIN_DISPLAY_PATH}"
     echo ""
+
+    run_kotlin_tests_if_needed
 
     # Keep old symlink locations working for compatibility
     # Create symlink in target/release for npm wrapper expectations

@@ -1,5 +1,23 @@
 use code_protocol::models::ResponseItem;
 
+pub struct ConversationHistoryFilterOutcome {
+    pub history: Vec<ResponseItem>,
+    pub removed_count: usize,
+}
+
+pub fn retain_api_messages_only(history: Vec<ResponseItem>) -> ConversationHistoryFilterOutcome {
+    let total = history.len();
+    let filtered: Vec<ResponseItem> = history
+        .into_iter()
+        .filter(|item| is_api_message(item))
+        .collect();
+    let removed_count = total.saturating_sub(filtered.len());
+    ConversationHistoryFilterOutcome {
+        history: filtered,
+        removed_count,
+    }
+}
+
 /// Transcript of conversation history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConversationHistory {
@@ -113,5 +131,27 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn retain_api_messages_only_drops_system_and_other() {
+        let mut history = Vec::new();
+        history.push(ResponseItem::Message {
+            id: None,
+            role: "system".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "ignored".to_string(),
+            }],
+        });
+        history.push(user_msg("keep"));
+        history.push(ResponseItem::Other);
+
+        let outcome = retain_api_messages_only(history);
+        assert_eq!(outcome.history.len(), 1);
+        assert_eq!(outcome.removed_count, 2);
+        match &outcome.history[0] {
+            ResponseItem::Message { role, .. } => assert_eq!(role, "user"),
+            other => panic!("unexpected item: {other:?}"),
+        }
     }
 }

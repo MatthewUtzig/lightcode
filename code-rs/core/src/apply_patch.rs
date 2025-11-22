@@ -42,6 +42,8 @@ pub(crate) async fn apply_patch(
     attempt_req: u64,
     output_index: Option<u32>,
     action: ApplyPatchAction,
+    reason: Option<String>,
+    grant_root: Option<PathBuf>,
 ) -> ApplyPatchResult {
     let (harness_summary_json, harness_status_message) = {
         let mut summary_json: Option<String> = None;
@@ -147,7 +149,13 @@ pub(crate) async fn apply_patch(
         SafetyCheck::AutoApprove { .. } => true,
         SafetyCheck::AskUser => {
             let rx = sess
-                .request_patch_approval(sub_id.to_owned(), call_id.to_owned(), &action, None, None)
+                .request_patch_approval(
+                    sub_id.to_owned(),
+                    call_id.to_owned(),
+                    &action,
+                    reason.clone(),
+                    grant_root.clone(),
+                )
                 .await;
             match rx.await.unwrap_or_default() {
                 ReviewDecision::Approved | ReviewDecision::ApprovedForSession => false,

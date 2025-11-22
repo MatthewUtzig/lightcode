@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -31,9 +32,10 @@ use code_common::elapsed::format_duration;
 use code_common::model_presets::ModelPreset;
 use code_common::model_presets::builtin_model_presets;
 use code_core::ConversationManager;
+use code_core::KotlinAutoCoordinatorRuntime;
 use code_core::agent_defaults::{agent_model_spec, enabled_agent_model_specs};
 use code_core::smoke_test_agent_blocking;
-use code_core::config::{clamp_reasoning_effort_for_model, Config};
+use code_core::config::{clamp_reasoning_effort_for_model, Config, EngineMode};
 use code_core::git_info::CommitLogEntry;
 use code_core::config_types::AgentConfig;
 use code_core::config_types::AutoDriveContinueMode;
@@ -139,12 +141,14 @@ use self::agent_install::{
     wrap_command,
 };
 use code_auto_drive_core::{
-    start_auto_coordinator,
     AutoCoordinatorCommand,
     AutoCoordinatorEvent,
     AutoCoordinatorEventSender,
     AutoCoordinatorHandle,
+    AutoCoordinatorRuntime,
+    AutoCoordinatorSpawnOptions,
     AutoCoordinatorStatus,
+    RustAutoCoordinatorRuntime,
     AutoDriveHistory,
     AutoDriveController,
     AutoRunSummary,
@@ -1310,6 +1314,8 @@ pub(crate) struct ChatWidget<'a> {
     context_last_sequence: Option<u64>,
     context_browser_sequence: Option<u64>,
     config: Config,
+    auto_coordinator_runtime: Arc<dyn AutoCoordinatorRuntime>,
+    engine_mode_label: Option<String>,
     history_debug_events: Option<RefCell<Vec<String>>>,
     latest_upgrade_version: Option<String>,
     initial_user_message: Option<UserMessage>,
@@ -1539,6 +1545,16 @@ pub(crate) struct ChatWidget<'a> {
     last_assigned_order: Option<OrderKey>,
     replay_history_depth: usize,
     resume_placeholder_visible: bool,
+}
+
+fn select_auto_coordinator_runtime(_config: &Config) -> Arc<dyn AutoCoordinatorRuntime> {
+    let env_override = env::var("CODEX_EXPERIMENTAL_KOTLIN_COORDINATOR");
+    if matches!(env_override.as_deref(), Ok("1")) {
+        tracing::info!(target = "auto_drive::kotlin", "using experimental KotlinAutoCoordinatorRuntime");
+        Arc::new(KotlinAutoCoordinatorRuntime::new())
+    } else {
+        Arc::new(RustAutoCoordinatorRuntime::default())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5080,6 +5096,7 @@ impl ChatWidget<'_> {
         // Initialize image protocol for rendering screenshots
 
         let auto_drive_variant = AutoDriveVariant::from_env();
+        let auto_coordinator_runtime = select_auto_coordinator_runtime(&config);
         let test_mode = is_test_mode();
 
         let bottom_pane = BottomPane::new(BottomPaneParams {
@@ -5100,6 +5117,8 @@ impl ChatWidget<'_> {
             active_exec_cell: None,
             history_cells,
             config: config.clone(),
+            auto_coordinator_runtime: auto_coordinator_runtime.clone(),
+            engine_mode_label: None,
             history_debug_events: if history_cell_logging_enabled() {
                 Some(RefCell::new(Vec::new()))
             } else {
@@ -5370,6 +5389,7 @@ impl ChatWidget<'_> {
         let (code_op_tx, mut code_op_rx) = unbounded_channel::<Op>();
 
         let auto_drive_variant = AutoDriveVariant::from_env();
+        let auto_coordinator_runtime = select_auto_coordinator_runtime(&config);
 
         // Forward events from existing conversation
         let app_event_tx_clone = app_event_tx.clone();
@@ -5419,6 +5439,8 @@ impl ChatWidget<'_> {
             active_exec_cell: None,
             history_cells,
             config: config.clone(),
+            auto_coordinator_runtime: auto_coordinator_runtime.clone(),
+            engine_mode_label: None,
             history_debug_events: if history_cell_logging_enabled() {
                 Some(RefCell::new(Vec::new()))
             } else {
@@ -11886,6 +11908,7 @@ impl ChatWidget<'_> {
                 self.remove_connecting_mcp_notice();
                 // Record session id for potential future fork/backtrack features
                 self.session_id = Some(event.session_id);
+                self.apply_engine_mode_label(&event.engine_mode);
                 self.bottom_pane
                     .set_history_metadata(event.history_log_id, event.history_entry_count);
                 // Record session information at the top of the conversation.
@@ -16068,12 +16091,11 @@ fi\n\
         };
 
         let auto_config = self.config_for_auto_drive();
-        match start_auto_coordinator(
+        match self.spawn_auto_coordinator_handle(
             coordinator_events,
             goal.clone(),
             conversation,
             auto_config,
-            self.config.debug,
             derive_goal_from_history,
         ) {
             Ok(handle) => {
@@ -16265,6 +16287,44 @@ fi\n\
         self.refresh_settings_overview_rows();
         self.auto_refresh_inactivity_watch();
         self.request_redraw();
+    }
+
+    pub(crate) fn set_preferred_engine_mode(&mut self, mode: EngineMode) {
+        if self.config.engine_mode == mode {
+            self.push_background_tail(format!(
+                "Default engine already set to {}.",
+                Self::pretty_engine_label(mode.as_str())
+            ));
+            if let Some(overlay) = self.settings.overlay.as_mut() {
+                if let Some(content) = overlay.misc_content_mut() {
+                    content.set_preferred_engine_mode(mode);
+                }
+            }
+            return;
+        }
+
+        self.config.engine_mode = mode;
+
+        if let Ok(home) = code_core::config::find_code_home() {
+            if let Err(err) = code_core::config::set_engine_mode(&home, mode) {
+                tracing::warn!("Failed to persist engine mode: {err}");
+            }
+        } else {
+            tracing::warn!("Could not locate config home to persist engine mode");
+        }
+
+        let notice = format!(
+            "Default engine set to {}. Restart Lightcode to apply.",
+            Self::pretty_engine_label(mode.as_str())
+        );
+        self.push_background_tail(notice);
+
+        if let Some(overlay) = self.settings.overlay.as_mut() {
+            if let Some(content) = overlay.misc_content_mut() {
+                content.set_preferred_engine_mode(mode);
+            }
+        }
+        self.refresh_settings_overview_rows();
     }
 
     fn inactivity_duration_from_minutes(minutes: Option<u16>) -> Option<Duration> {
@@ -16510,6 +16570,25 @@ fi\n\
             .auto_state
             .pause_for_transient_failure(Instant::now(), message);
         self.auto_apply_controller_effects(effects);
+    }
+
+    fn spawn_auto_coordinator_handle(
+        &self,
+        event_sender: AutoCoordinatorEventSender,
+        goal_text: String,
+        conversation: Vec<ResponseItem>,
+        auto_config: Config,
+        derive_goal_from_history: bool,
+    ) -> anyhow::Result<AutoCoordinatorHandle> {
+        let options = AutoCoordinatorSpawnOptions {
+            event_tx: event_sender,
+            goal_text,
+            conversation,
+            config: auto_config,
+            debug_enabled: self.config.debug,
+            derive_goal_from_history,
+        };
+        self.auto_coordinator_runtime.spawn(options)
     }
 
     pub(crate) fn auto_handle_decision(
@@ -20550,9 +20629,39 @@ Have we met every part of this goal and is there no further work to do?"#
 
     fn build_misc_settings_content(&self) -> MiscSettingsContent {
         MiscSettingsContent::new(
+            self.engine_mode_display_text(),
+            self.config.engine_mode,
             self.config.auto_drive.inactivity_timeout_minutes,
             self.app_event_tx.clone(),
         )
+    }
+
+    fn engine_mode_display_text(&self) -> String {
+        self.engine_mode_label.clone().unwrap_or_else(|| {
+            Self::pretty_engine_label(self.config.engine_mode.as_str())
+        })
+    }
+
+    fn apply_engine_mode_label(&mut self, raw: &str) {
+        let pretty = Self::pretty_engine_label(raw);
+        let changed = self.engine_mode_label.as_deref() != Some(pretty.as_str());
+        self.engine_mode_label = Some(pretty.clone());
+        if let Some(overlay) = self.settings.overlay.as_mut() {
+            if let Some(content) = overlay.misc_content_mut() {
+                content.set_core_engine_label(pretty.clone());
+            }
+        }
+        if changed {
+            self.refresh_settings_overview_rows();
+        }
+    }
+
+    fn pretty_engine_label(raw: &str) -> String {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "kotlin" => "Kotlin".to_string(),
+            "rust" => "Rust".to_string(),
+            other => other.to_string(),
+        }
     }
 
     fn build_chrome_settings_content(&self, port: Option<u16>) -> ChromeSettingsContent {
@@ -21038,11 +21147,12 @@ Have we met every part of this goal and is there no further work to do?"#
     }
 
     fn settings_summary_misc(&self) -> Option<String> {
-        let label = match self.config.auto_drive.inactivity_timeout_minutes {
+        let timeout = match self.config.auto_drive.inactivity_timeout_minutes {
             Some(0) | None => "Auto inactivity timeout: Off".to_string(),
             Some(minutes) => format!("Auto inactivity timeout: {} min", minutes),
         };
-        Some(label)
+        let engine = self.engine_mode_display_text();
+        Some(format!("Core engine: {} · {}", engine, timeout))
     }
 
     fn refresh_settings_overview_rows(&mut self) {

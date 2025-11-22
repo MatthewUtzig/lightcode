@@ -643,6 +643,7 @@ fn derive_config_from_params(
         model,
         review_model: None,
         auto_model: None,
+        engine_mode: None,
         config_profile: profile,
         cwd: cwd.map(PathBuf::from),
         approval_policy: approval_policy.map(map_ask_for_approval_from_wire),

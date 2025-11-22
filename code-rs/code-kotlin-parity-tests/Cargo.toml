@@ -1,0 +1,13 @@
+[package]
+name = "code-kotlin-parity-tests"
+version = { workspace = true }
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serial_test = "3"
+code-auto-drive-core = { path = "../code-auto-drive-core" }
+code-kotlin-host = { path = "../code-kotlin-host" }
+codex_core_jni = { package = "code-core-jni", path = "../code-core-jni" }

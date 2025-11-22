@@ -97,6 +97,7 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: session_uuid,
                 model: "gpt-4o".to_string(),
+                engine_mode: "kotlin".to_string(),
                 history_log_id: 1,
                 history_entry_count: 1000,
             }),
@@ -128,6 +129,7 @@ mod tests {
         let session_configured_event = SessionConfiguredEvent {
             session_id: session_uuid,
             model: "gpt-4o".to_string(),
+            engine_mode: "kotlin".to_string(),
             history_log_id: 1,
             history_entry_count: 1000,
         };

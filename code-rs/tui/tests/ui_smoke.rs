@@ -20,6 +20,7 @@ use code_core::protocol::{
     AgentMessageDeltaEvent,
     AgentMessageEvent,
     ApplyPatchApprovalRequestEvent,
+    BackgroundEventEvent,
     CustomToolCallBeginEvent,
     CustomToolCallEndEvent,
     ExecApprovalRequestEvent,
@@ -33,6 +34,8 @@ use code_core::protocol::{
     McpInvocation,
     McpToolCallBeginEvent,
     McpToolCallEndEvent,
+    PatchApplyBeginEvent,
+    PatchApplyEndEvent,
     OrderMeta,
     SessionConfiguredEvent,
     TokenUsage,
@@ -695,6 +698,171 @@ fn smoke_custom_tool_call() {
 }
 
 #[test]
+fn smoke_kotlin_engine_simple_turn() {
+    code_tui::test_helpers::set_test_env_var("CODE_ENGINE", "kotlin");
+    let mut harness = ChatWidgetHarness::new();
+    seed_session(&mut harness);
+
+    harness.submit_text_message("Status check");
+
+    code_tui::test_helpers::assert_has_background_event_containing(
+        &mut harness,
+        "[Kotlin Auto Drive]",
+    );
+}
+
+#[test]
+fn smoke_kotlin_exec_and_patch_flow() {
+    code_tui::test_helpers::set_test_env_var("CODE_ENGINE", "kotlin");
+    let mut harness = ChatWidgetHarness::new();
+    seed_session(&mut harness);
+
+    seed_kotlin_exec_patch_events(&mut harness);
+
+    code_tui::test_helpers::assert_has_insert_history(&mut harness);
+    let records = code_tui::test_helpers::history_records(&mut harness);
+
+    let exec_record = records
+        .iter()
+        .find_map(|record| match record {
+            HistoryRecord::Exec(record) => Some(record.clone()),
+            _ => None,
+        })
+        .expect("exec record present");
+    assert_eq!(exec_record.exit_code, Some(0), "exec should succeed");
+    let stdout = exec_record
+        .stdout_chunks
+        .iter()
+        .map(|chunk| chunk.content.as_str())
+        .collect::<String>();
+    assert!(stdout.contains("Kotlin exec demo"), "expected Kotlin exec output");
+
+    let patch_record = records
+        .iter()
+        .filter_map(|record| match record {
+            HistoryRecord::Patch(record) => Some(record.clone()),
+            _ => None,
+        })
+        .find(|record| matches!(record.patch_type, PatchEventType::ApplySuccess))
+        .expect("applied patch record present");
+    assert!(
+        matches!(patch_record.patch_type, PatchEventType::ApplySuccess),
+        "expected applied patch cell"
+    );
+    assert!(
+        patch_record
+            .changes
+            .keys()
+            .any(|path| path.ends_with("KOTLIN_PLAN.md")),
+        "expected Kotlin patch change",
+    );
+}
+
+fn seed_kotlin_exec_patch_events(harness: &mut ChatWidgetHarness) {
+    let order = |sequence_number: u64| -> Option<OrderMeta> {
+        Some(OrderMeta {
+            request_ordinal: 1,
+            output_index: Some(0),
+            sequence_number: Some(sequence_number),
+        })
+    };
+    let exec_call = "kexec-demo".to_string();
+    harness.handle_event(Event {
+        id: "kotlin-exec-approval".into(),
+        event_seq: 0,
+        msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+            call_id: exec_call.clone(),
+            command: vec!["bash".into(), "-lc".into(), "echo Kotlin".into()],
+            cwd: PathBuf::from("/tmp"),
+            reason: Some("Demo exec".into()),
+        }),
+        order: order(0),
+    });
+    harness.handle_event(Event {
+        id: "kotlin-exec-begin".into(),
+        event_seq: 1,
+        msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: exec_call.clone(),
+            command: vec!["bash".into(), "-lc".into(), "echo Kotlin".into()],
+            cwd: PathBuf::from("/tmp"),
+            parsed_cmd: Vec::new(),
+        }),
+        order: order(1),
+    });
+    harness.handle_event(Event {
+        id: "kotlin-exec-output".into(),
+        event_seq: 2,
+        msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: exec_call.clone(),
+            stream: ExecOutputStream::Stdout,
+            chunk: ByteBuf::from(b"Kotlin exec demo\n".to_vec()),
+        }),
+        order: order(2),
+    });
+    harness.handle_event(Event {
+        id: "kotlin-exec-end".into(),
+        event_seq: 3,
+        msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: exec_call,
+            stdout: "Kotlin exec demo\n".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration: Duration::from_millis(120),
+        }),
+        order: order(3),
+    });
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(
+        PathBuf::from("KOTLIN_PLAN.md"),
+        FileChange::Add {
+            content: "# Kotlin Patch\nThis file proves Kotlin can apply patches.".into(),
+        },
+    );
+    let patch_call = "kpatch-demo".to_string();
+    harness.handle_event(Event {
+        id: "kotlin-patch-approval".into(),
+        event_seq: 4,
+        msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+            call_id: patch_call.clone(),
+            changes: changes.clone(),
+            reason: Some("Demo patch".into()),
+            grant_root: None,
+        }),
+        order: order(4),
+    });
+    harness.handle_event(Event {
+        id: "kotlin-patch-begin".into(),
+        event_seq: 5,
+        msg: EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+            call_id: patch_call.clone(),
+            auto_approved: false,
+            changes: changes.clone(),
+        }),
+        order: order(5),
+    });
+    harness.handle_event(Event {
+        id: "kotlin-patch-end".into(),
+        event_seq: 6,
+        msg: EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+            call_id: patch_call,
+            stdout: "Patch applied".into(),
+            stderr: String::new(),
+            success: true,
+        }),
+        order: order(6),
+    });
+    harness.handle_event(Event {
+        id: "kotlin-background".into(),
+        event_seq: 7,
+        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+            message: "[Kotlin Auto Drive] demo flow".into(),
+        }),
+        order: order(7),
+    });
+}
+
+#[test]
 fn smoke_review_settings_auto_resolve_controls() {
     let mut harness = ChatWidgetHarness::new();
 
@@ -812,6 +980,7 @@ fn seed_session(harness: &mut ChatWidgetHarness) {
         msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
             session_id: Uuid::new_v4(),
             model: "gpt-5.1-codex".into(),
+            engine_mode: "kotlin".into(),
             history_log_id: 0,
             history_entry_count: 0,
         }),

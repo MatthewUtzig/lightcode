@@ -1,3 +1,4 @@
+use code_core::config::EngineMode;
 use code_core::config_types::ReasoningEffort;
 use code_core::config_types::TextVerbosity;
 use code_core::config_types::ThemeName;
@@ -174,6 +175,9 @@ pub(crate) enum AppEvent {
     },
     UpdateAutoDriveTimeout {
         minutes: Option<u16>,
+    },
+    UpdateEngineMode {
+        mode: EngineMode,
     },
     /// Trigger an automatic Auto Drive restart after a transient failure.
     AutoCoordinatorRestart {

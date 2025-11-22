@@ -44,6 +44,9 @@ pub(crate) async fn handle_create_conversation(
 
     let overrides = ConfigOverrides {
         model: Some(model.clone()),
+        review_model: None,
+        auto_model: None,
+        engine_mode: None,
         cwd: Some(PathBuf::from(cwd)),
         approval_policy,
         sandbox_mode: sandbox,

@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use code_core::config::Config;
+use code_core::{chat_turn_payload, KotlinAutoCoordinatorRuntime, KotlinCoreHost, KotlinEngineEvent};
 use code_core::agent_defaults::build_model_guide_description;
 use code_core::config_types::{AutoDriveSettings, ReasoningEffort, TextVerbosity};
 use code_core::debug_logger::DebugLogger;
@@ -48,6 +49,7 @@ const MAX_RETRY_ELAPSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_DECISION_RECOVERY_ATTEMPTS: u32 = 3;
 const MESSAGE_LIMIT_FALLBACK: usize = 120;
 const DEBUG_JSON_MAX_CHARS: usize = 1200;
+const KOTLIN_STOP_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 #[error("auto coordinator cancelled")]
@@ -151,6 +153,416 @@ impl AutoCoordinatorEvent {
             Self::StopAck => "stop_ack",
         }
     }
+}
+
+pub struct AutoCoordinatorSpawnOptions {
+    pub event_tx: AutoCoordinatorEventSender,
+    pub goal_text: String,
+    pub conversation: Vec<ResponseItem>,
+    pub config: Config,
+    pub debug_enabled: bool,
+    pub derive_goal_from_history: bool,
+}
+
+pub trait AutoCoordinatorRuntime: Send + Sync {
+    fn spawn(&self, options: AutoCoordinatorSpawnOptions) -> Result<AutoCoordinatorHandle>;
+}
+
+#[derive(Default)]
+pub struct RustAutoCoordinatorRuntime;
+
+impl AutoCoordinatorRuntime for RustAutoCoordinatorRuntime {
+    fn spawn(&self, options: AutoCoordinatorSpawnOptions) -> Result<AutoCoordinatorHandle> {
+        start_auto_coordinator(
+            options.event_tx,
+            options.goal_text,
+            options.conversation,
+            options.config,
+            options.debug_enabled,
+            options.derive_goal_from_history,
+        )
+    }
+}
+
+impl AutoCoordinatorRuntime for KotlinAutoCoordinatorRuntime {
+    fn spawn(&self, options: AutoCoordinatorSpawnOptions) -> Result<AutoCoordinatorHandle> {
+        start_kotlin_auto_coordinator(self, options)
+    }
+}
+
+fn start_kotlin_auto_coordinator(
+    runtime: &KotlinAutoCoordinatorRuntime,
+    options: AutoCoordinatorSpawnOptions,
+) -> Result<AutoCoordinatorHandle> {
+    let host = KotlinCoreHost::new().context("constructing Kotlin coordinator host")?;
+    KotlinRuntimeWorker::spawn(runtime.clone(), host, options)
+}
+
+struct KotlinRuntimeWorker {
+    runtime: KotlinAutoCoordinatorRuntime,
+    host: KotlinCoreHost,
+    event_tx: AutoCoordinatorEventSender,
+    goal_text: String,
+    conversation: Vec<ResponseItem>,
+    _config: Config,
+    _debug_enabled: bool,
+    _derive_goal_from_history: bool,
+    poll_error_logged: bool,
+    next_decision_seq: u64,
+    stop_requested: bool,
+    stop_requested_at: Option<Instant>,
+    stop_ack_sent: bool,
+}
+
+impl KotlinRuntimeWorker {
+    fn spawn(
+        runtime: KotlinAutoCoordinatorRuntime,
+        host: KotlinCoreHost,
+        options: AutoCoordinatorSpawnOptions,
+    ) -> Result<AutoCoordinatorHandle> {
+        let AutoCoordinatorSpawnOptions {
+            event_tx,
+            goal_text,
+            conversation,
+            config,
+            debug_enabled,
+            derive_goal_from_history,
+        } = options;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let cancel_token = CancellationToken::new();
+        let worker_cancel = cancel_token.clone();
+        let worker = Self {
+            runtime,
+            host,
+            event_tx,
+            goal_text,
+            conversation,
+            _config: config,
+            _debug_enabled: debug_enabled,
+            _derive_goal_from_history: derive_goal_from_history,
+            poll_error_logged: false,
+            next_decision_seq: 1,
+            stop_requested: false,
+            stop_requested_at: None,
+            stop_ack_sent: false,
+        };
+
+        std::thread::Builder::new()
+            .name("kotlin-auto-coordinator".to_string())
+            .spawn(move || {
+                if let Err(err) = worker.run(cmd_rx, worker_cancel) {
+                    tracing::error!("kotlin auto coordinator worker error: {err:#}");
+                }
+            })
+            .context("spawning kotlin auto coordinator worker")?;
+
+        Ok(AutoCoordinatorHandle {
+            tx: cmd_tx,
+            cancel_token,
+        })
+    }
+
+    fn run(
+        mut self,
+        cmd_rx: Receiver<AutoCoordinatorCommand>,
+        cancel_token: CancellationToken,
+    ) -> Result<()> {
+        self.submit_initial_turn()?;
+        while !cancel_token.is_cancelled() {
+            if self.stop_ack_sent {
+                break;
+            }
+            match cmd_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(cmd) => {
+                    if self.handle_command(cmd)? {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => self.poll_kotlin_events(),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            self.maybe_emit_stop_timeout();
+        }
+        Ok(())
+    }
+
+    fn submit_initial_turn(&mut self) -> Result<()> {
+        if let Some(session_config) = self.runtime.session_config() {
+            debug!(target = "auto_drive::kotlin", config = ?session_config, "kotlin coordinator session config loaded");
+        }
+        self.submit_conversation_to_kotlin()
+    }
+
+    fn submit_conversation_to_kotlin(&mut self) -> Result<()> {
+        let payload = chat_turn_payload(&self.conversation, &[])?;
+        self.host
+            .submit_json(&payload)
+            .context("submitting Kotlin chat turn")
+    }
+
+    fn handle_command(&mut self, command: AutoCoordinatorCommand) -> Result<bool> {
+        match command {
+            AutoCoordinatorCommand::Stop => {
+                if self.stop_ack_sent {
+                    return Ok(true);
+                }
+                if self.stop_requested {
+                    return Ok(false);
+                }
+                let payload = json!({
+                    "type": "control",
+                    "command": "stop",
+                });
+                match self.host.submit_json(&payload) {
+                    Ok(()) => {
+                        self.stop_requested = true;
+                        self.stop_requested_at = Some(Instant::now());
+                        Ok(false)
+                    }
+                    Err(err) => {
+                        warn!(target = "auto_drive::kotlin", "failed to submit stop control: {err:#}");
+                        self.emit_stop_ack();
+                        Ok(true)
+                    }
+                }
+            }
+            AutoCoordinatorCommand::AckDecision { .. } => Ok(false),
+            AutoCoordinatorCommand::UpdateConversation(conversation) => {
+                self.conversation = conversation;
+                Ok(false)
+            }
+            AutoCoordinatorCommand::HandleUserPrompt { _prompt, conversation } => {
+                self.conversation = conversation;
+                if let Err(err) = self.submit_conversation_to_kotlin() {
+                    warn!(target = "auto_drive::kotlin", "failed to submit chat turn: {err:#}");
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn maybe_emit_stop_timeout(&mut self) {
+        if !self.stop_requested || self.stop_ack_sent {
+            return;
+        }
+        if let Some(requested_at) = self.stop_requested_at {
+            if requested_at.elapsed() > KOTLIN_STOP_ACK_TIMEOUT {
+                warn!(target = "auto_drive::kotlin", "timed out waiting for Kotlin stop ack; using local ack");
+                self.emit_stop_ack();
+            }
+        }
+    }
+
+    fn poll_kotlin_events(&mut self) {
+        match self.host.poll_events() {
+            Ok(events) => {
+                for event in events {
+                    if let Err(err) = self.handle_engine_event(event) {
+                        warn!(target = "auto_drive::kotlin", "failed to handle Kotlin event: {err:#}");
+                    }
+                }
+            }
+            Err(err) => {
+                if !self.poll_error_logged {
+                    warn!(target = "auto_drive::kotlin", "failed to poll Kotlin host events: {err:#}");
+                    self.poll_error_logged = true;
+                }
+            }
+        }
+    }
+
+    fn handle_engine_event(&mut self, event: KotlinEngineEvent) -> Result<()> {
+        match event.kind.as_str() {
+            "kotlin_coordinator_event" => self.handle_kotlin_coordinator_event(event.payload),
+            _ => Ok(()),
+        }
+    }
+
+    fn handle_kotlin_coordinator_event(&mut self, payload: Value) -> Result<()> {
+        let event: KotlinCoordinatorEvent = serde_json::from_value(payload)?;
+        for decision in event.decisions {
+            match decision {
+                KotlinCoordinatorDecisionPayload::Thinking { text, summary_index } => {
+                    self.event_tx.send(AutoCoordinatorEvent::Thinking {
+                        delta: text,
+                        summary_index,
+                    });
+                }
+                KotlinCoordinatorDecisionPayload::FinalAnswer { text } => {
+                    let item = self.push_assistant_message(text.clone());
+                    self.emit_decision(
+                        AutoCoordinatorStatus::Success,
+                        vec![item],
+                        None,
+                        Some("Kotlin coordinator".to_string()),
+                        Some(text),
+                    );
+                }
+                KotlinCoordinatorDecisionPayload::RequestExecCommand { command, preview, rationale } => {
+                    let summary = preview
+                        .as_deref()
+                        .unwrap_or_else(|| command.lines().next().unwrap_or("(command)"));
+                    let text = format!("Kotlin requested exec: {summary}");
+                    let item = self.push_assistant_message(text);
+                    let cli_action = AutoTurnCliAction {
+                        prompt: command,
+                        context: rationale.clone(),
+                        suppress_ui_context: false,
+                    };
+                    self.emit_decision(
+                        AutoCoordinatorStatus::Continue,
+                        vec![item],
+                        Some(cli_action),
+                        Some("Kotlin exec request".to_string()),
+                        rationale.clone(),
+                    );
+                }
+                KotlinCoordinatorDecisionPayload::RequestApplyPatch { patch, preview, rationale } => {
+                    let summary = preview
+                        .as_deref()
+                        .unwrap_or_else(|| patch.lines().next().unwrap_or("(patch)"));
+                    let text = format!("Kotlin requested apply_patch: {summary}");
+                    let item = self.push_assistant_message(text);
+                    let cli_action = AutoTurnCliAction {
+                        prompt: build_apply_patch_command(&patch),
+                        context: rationale.clone().or(preview.clone()),
+                        suppress_ui_context: false,
+                    };
+                    self.emit_decision(
+                        AutoCoordinatorStatus::Continue,
+                        vec![item],
+                        Some(cli_action),
+                        Some("Kotlin apply_patch request".to_string()),
+                        rationale.clone(),
+                    );
+                }
+                KotlinCoordinatorDecisionPayload::StopAck => {
+                    self.emit_stop_ack();
+                }
+            }
+        }
+
+        if let Some(metrics) = event.token_metrics {
+            self.event_tx.send(AutoCoordinatorEvent::TokenMetrics {
+                total_usage: metrics.total_usage,
+                last_turn_usage: metrics.last_turn_usage,
+                turn_count: metrics.turn_count,
+                duplicate_items: metrics.duplicate_items,
+                replay_updates: metrics.replay_updates,
+            });
+        }
+        Ok(())
+    }
+
+    fn push_assistant_message(&mut self, text: String) -> ResponseItem {
+        let item = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText { text: text.clone() }],
+        };
+        self.conversation.push(item.clone());
+        item
+    }
+
+    fn emit_decision(
+        &mut self,
+        status: AutoCoordinatorStatus,
+        transcript: Vec<ResponseItem>,
+        cli: Option<AutoTurnCliAction>,
+        status_title: Option<String>,
+        status_sent_to_user: Option<String>,
+    ) {
+        let seq = self.next_decision_seq;
+        self.next_decision_seq = self.next_decision_seq.saturating_add(1);
+        let auto_summary = transcript
+            .iter()
+            .find_map(|item| match item {
+                ResponseItem::Message { content, .. } => content.first().and_then(|c| match c {
+                    ContentItem::OutputText { text } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{status:?}"));
+        let title = status_title.unwrap_or_else(|| match status {
+            AutoCoordinatorStatus::Continue => "Kotlin coordinator".to_string(),
+            AutoCoordinatorStatus::Success => "Kotlin coordinator".to_string(),
+            AutoCoordinatorStatus::Failed => "Kotlin coordinator failure".to_string(),
+        });
+        let sent_to_user = status_sent_to_user.unwrap_or_else(|| auto_summary.clone());
+        self.event_tx.send(AutoCoordinatorEvent::Decision {
+            seq,
+            status,
+            status_title: Some(title),
+            status_sent_to_user: Some(sent_to_user),
+            goal: Some(self.goal_text.clone()),
+            cli,
+            agents_timing: None,
+            agents: Vec::new(),
+            transcript,
+        });
+    }
+
+    fn emit_stop_ack(&mut self) {
+        if self.stop_ack_sent {
+            return;
+        }
+        self.stop_ack_sent = true;
+        self.event_tx.send(AutoCoordinatorEvent::StopAck);
+    }
+}
+
+fn build_apply_patch_command(patch: &str) -> String {
+    let mut command = String::from("apply_patch <<'PATCH'\n");
+    command.push_str(patch);
+    if !patch.ends_with('\n') {
+        command.push('\n');
+    }
+    command.push_str("PATCH");
+    command
+}
+
+#[derive(Deserialize)]
+struct KotlinCoordinatorEvent {
+    decisions: Vec<KotlinCoordinatorDecisionPayload>,
+    #[serde(default)]
+    token_metrics: Option<KotlinTokenMetricsPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum KotlinCoordinatorDecisionPayload {
+    Thinking {
+        text: String,
+        #[serde(default)]
+        summary_index: Option<u32>,
+    },
+    FinalAnswer {
+        text: String,
+    },
+    RequestExecCommand {
+        command: String,
+        #[serde(default)]
+        preview: Option<String>,
+        rationale: Option<String>,
+    },
+    RequestApplyPatch {
+        patch: String,
+        #[serde(default)]
+        preview: Option<String>,
+        rationale: Option<String>,
+    },
+    StopAck,
+}
+
+#[derive(Deserialize)]
+struct KotlinTokenMetricsPayload {
+    total_usage: TokenUsage,
+    last_turn_usage: TokenUsage,
+    turn_count: u32,
+    duplicate_items: u32,
+    replay_updates: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -710,6 +1122,15 @@ mod tests {
             MESSAGE_LIMIT_FALLBACK,
             true,
         ));
+    }
+
+    #[test]
+    fn build_apply_patch_command_wraps_patch() {
+        let body = "--- a/file.rs\n+++ b/file.rs\n+fn demo() {}";
+        let command = build_apply_patch_command(body);
+        assert!(command.starts_with("apply_patch <<'PATCH'"));
+        assert!(command.ends_with("PATCH"));
+        assert!(command.contains(body));
     }
 }
 
@@ -1315,14 +1736,14 @@ fn run_auto_loop(
     Ok(())
 }
 
-fn filter_popular_commands(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+pub fn filter_popular_commands(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
     items
         .into_iter()
         .filter(|item| !is_popular_commands_message(item))
         .collect()
 }
 
-fn is_popular_commands_message(item: &ResponseItem) -> bool {
+pub fn is_popular_commands_message(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, content, .. } if role.eq_ignore_ascii_case("user") => {
             content.iter().any(|c| match c {
@@ -1364,16 +1785,17 @@ fn build_developer_message(
     (coordinator_message, intro, primary_goal)
 }
 
-struct InitialPlanningSeed {
-    response_json: String,
-    cli_prompt: String,
-    goal_message: String,
-    status_title: String,
-    status_sent_to_user: String,
-    agents_timing: Option<AutoTurnAgentsTiming>,
+#[derive(Debug, Clone)]
+pub struct InitialPlanningSeed {
+    pub response_json: String,
+    pub cli_prompt: String,
+    pub goal_message: String,
+    pub status_title: String,
+    pub status_sent_to_user: String,
+    pub agents_timing: Option<AutoTurnAgentsTiming>,
 }
 
-fn build_initial_planning_seed(goal_text: &str, include_agents: bool) -> Option<InitialPlanningSeed> {
+pub fn build_initial_planning_seed(goal_text: &str, include_agents: bool) -> Option<InitialPlanningSeed> {
     let goal = goal_text.trim();
     if goal.is_empty() {
         return None;

@@ -6,6 +6,159 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRecordKind {
+    Assistant,
+    User,
+    System,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRecordPayload {
+    pub kind: SnapshotRecordKind,
+    pub stream_id: Option<String>,
+    pub markdown: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotCoalesceOutcome {
+    pub records: Vec<SnapshotRecordPayload>,
+    pub removed_count: usize,
+}
+
+pub fn coalesce_snapshot_records(records: Vec<SnapshotRecordPayload>) -> SnapshotCoalesceOutcome {
+    let mut seen_streams: HashSet<String> = HashSet::new();
+    let mut retained = Vec::with_capacity(records.len());
+    let mut removed = 0;
+
+    for record in records {
+        let should_skip = matches!(record.kind, SnapshotRecordKind::Assistant)
+            && record
+                .stream_id
+                .as_ref()
+                .map(|id| !seen_streams.insert(id.clone()))
+                .unwrap_or(false);
+
+        if should_skip {
+            removed += 1;
+            continue;
+        }
+
+        retained.push(record);
+    }
+
+    SnapshotCoalesceOutcome {
+        records: retained,
+        removed_count: removed,
+    }
+}
+
+pub fn snapshot_from_records(records: Vec<SnapshotRecordPayload>) -> HistorySnapshot {
+    let history_records = records
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| match payload.kind {
+            SnapshotRecordKind::Assistant => HistoryRecord::AssistantMessage(AssistantMessageState {
+                id: HistoryId(index as u64 + 1),
+                stream_id: payload.stream_id,
+                markdown: payload.markdown.unwrap_or_default(),
+                citations: Vec::new(),
+                metadata: None,
+                token_usage: None,
+                created_at: SystemTime::UNIX_EPOCH,
+            }),
+            SnapshotRecordKind::User => make_plain_message(
+                index,
+                payload.markdown.unwrap_or_default(),
+                PlainMessageRole::User,
+                PlainMessageKind::User,
+            ),
+            SnapshotRecordKind::System => make_plain_message(
+                index,
+                payload.markdown.unwrap_or_default(),
+                PlainMessageRole::System,
+                PlainMessageKind::Plain,
+            ),
+            SnapshotRecordKind::Other => make_plain_message(
+                index,
+                payload.markdown.unwrap_or_default(),
+                PlainMessageRole::BackgroundEvent,
+                PlainMessageKind::Background,
+            ),
+        })
+        .collect();
+
+    HistorySnapshot {
+        records: history_records,
+        next_id: 0,
+        exec_call_lookup: HashMap::new(),
+        tool_call_lookup: HashMap::new(),
+        stream_lookup: HashMap::new(),
+        order: Vec::new(),
+        order_debug: Vec::new(),
+    }
+}
+
+fn make_plain_message(
+    index: usize,
+    text: String,
+    role: PlainMessageRole,
+    kind: PlainMessageKind,
+) -> HistoryRecord {
+    let lines = if text.trim().is_empty() {
+        vec![MessageLine {
+            kind: MessageLineKind::Blank,
+            spans: Vec::new(),
+        }]
+    } else {
+        text.lines()
+            .map(|line| MessageLine {
+                kind: MessageLineKind::Paragraph,
+                spans: vec![InlineSpan {
+                    text: line.to_string(),
+                    tone: TextTone::Default,
+                    emphasis: TextEmphasis::default(),
+                    entity: None,
+                }],
+            })
+            .collect()
+    };
+
+    HistoryRecord::PlainMessage(PlainMessageState {
+        id: HistoryId(index as u64 + 1),
+        role,
+        kind,
+        header: None,
+        lines,
+        metadata: None,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotSummary {
+    pub record_count: usize,
+    pub assistant_messages: usize,
+    pub user_messages: usize,
+}
+
+pub fn summarize_snapshot(records: Vec<SnapshotRecordPayload>) -> SnapshotSummary {
+    let assistant = records
+        .iter()
+        .filter(|record| record.kind == SnapshotRecordKind::Assistant)
+        .count();
+    let user = records
+        .iter()
+        .filter(|record| record.kind == SnapshotRecordKind::User)
+        .count();
+    SnapshotSummary {
+        record_count: records.len(),
+        assistant_messages: assistant,
+        user_messages: user,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoryRecord {
     PlainMessage(PlainMessageState),

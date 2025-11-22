@@ -16,6 +16,8 @@ mod chat_completions;
 mod client;
 mod client_common;
 pub mod codex;
+mod kotlin_host;
+pub use kotlin_host::{chat_turn_payload, KotlinAutoCoordinatorRuntime, KotlinCoreHost, EngineEvent as KotlinEngineEvent};
 mod code_conversation;
 pub mod token_data;
 pub use code_conversation::CodexConversation;
@@ -79,8 +81,12 @@ pub mod review_format;
 #[cfg(test)]
 mod prompt_assembly_tests;
 pub use code_protocol::protocol::InitialHistory;
+pub use conversation_manager::ConversationForkOutcome;
 pub use conversation_manager::ConversationManager;
+pub use conversation_manager::ConversationPruneOutcome;
 pub use conversation_manager::NewConversation;
+pub use conversation_manager::fork_history_from_response_items;
+pub use conversation_manager::prune_history_after_dropping_last_user_turns;
 // Re-export common auth types for workspace consumers
 pub use auth::AuthManager;
 pub use auth::CodexAuth;
@@ -131,6 +137,14 @@ pub use housekeeping::CleanupOutcome;
 pub use code_protocol::config_types as protocol_config_types;
 // Preserve `code_core::models::...` imports as an alias to the protocol models.
 pub use code_protocol::models as models;
+pub use conversation_history::retain_api_messages_only;
+pub use conversation_history::ConversationHistoryFilterOutcome;
+pub use history::state::SnapshotCoalesceOutcome;
+pub use history::state::SnapshotRecordKind;
+pub use history::state::SnapshotRecordPayload;
+pub use history::state::coalesce_snapshot_records;
+pub use history::state::snapshot_from_records;
+pub use history::state::summarize_snapshot;
 
 pub use client::ModelClient;
 pub use client_common::Prompt;

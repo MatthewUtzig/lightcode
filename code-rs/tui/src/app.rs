@@ -1842,6 +1842,11 @@ impl App<'_> {
                         widget.set_auto_drive_inactivity_timeout(minutes);
                     }
                 }
+                AppEvent::UpdateEngineMode { mode } => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.set_preferred_engine_mode(mode);
+                    }
+                }
                 AppEvent::RequestAgentInstall { name, selected_index } => {
                     if let AppState::Chat { widget } = &mut self.app_state {
                         if let Some(launch) = widget.launch_agent_install(name, selected_index) {

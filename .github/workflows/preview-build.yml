@@ -27,6 +27,7 @@ jobs:
       )
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: kotlin-core
     env:
       # Consistent Cargo/rustup homes for caching across all workflows
       CARGO_HOME: ${{ github.workspace }}/.cargo-home
@@ -147,21 +148,37 @@ jobs:
           cd "${RUST_WORKSPACE_DIR}"
           cargo build --release --locked --target "${{ matrix.target }}" --bin code
 
+      - name: Download Kotlin engine jar
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-engine-jar
+          path: kotlin-engine
+
       - name: Prepare artifacts
         shell: bash
         run: |
-          mkdir -p artifacts
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp "${RUST_WORKSPACE_DIR}/target/${{ matrix.target }}/release/code.exe" "artifacts/${{ matrix.artifact }}"
-          else
-            cp "${RUST_WORKSPACE_DIR}/target/${{ matrix.target }}/release/code" "artifacts/${{ matrix.artifact }}"
+          set -euo pipefail
+          jar_src="$(ls kotlin-engine/*.jar 2>/dev/null | head -n1)"
+          if [[ -z "$jar_src" ]]; then
+            echo "Kotlin engine jar not found" >&2
+            exit 1
           fi
+          mkdir -p artifacts
+          pkg_root="artifacts/${{ matrix.artifact }}"
+          rm -rf "$pkg_root"
+          mkdir -p "$pkg_root/bin"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp "${RUST_WORKSPACE_DIR}/target/${{ matrix.target }}/release/code.exe" "$pkg_root/bin/code.exe"
+          else
+            cp "${RUST_WORKSPACE_DIR}/target/${{ matrix.target }}/release/code" "$pkg_root/bin/code"
+          fi
+          cp "$jar_src" "$pkg_root/bin/code-kotlin-engine.jar"
 
       - name: Compress artifacts (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Get-ChildItem artifacts -File | ForEach-Object {
+          Get-ChildItem artifacts | ForEach-Object {
             $src = $_.FullName
             $dst = "$src.zip"
             Compress-Archive -Path $src -DestinationPath $dst -Force
@@ -174,15 +191,20 @@ jobs:
         run: |
           shopt -s nullglob
           for f in artifacts/*; do
-            [ -f "$f" ] || continue
             base=$(basename "$f")
-            # .zst (size-optimized)
-            if command -v zstd >/dev/null 2>&1; then
-              zstd -T0 -19 --force -o "artifacts/${base}.zst" "$f" || true
+            if [[ -d "$f" ]]; then
+              if command -v zstd >/dev/null 2>&1; then
+                tar -C artifacts -cf - "$base" | zstd -T0 -19 --force > "artifacts/${base}.tar.zst" || true
+              fi
+              tar -C artifacts -czf "artifacts/${base}.tar.gz" "$base"
+              rm -rf "$f"
+            elif [[ -f "$f" ]]; then
+              if command -v zstd >/dev/null 2>&1; then
+                zstd -T0 -19 --force -o "artifacts/${base}.zst" "$f" || true
+              fi
+              tar -C artifacts -czf "artifacts/${base}.tar.gz" "$base"
+              rm -f "$f"
             fi
-            # .tar.gz fallback
-            tar -C artifacts -czf "artifacts/${base}.tar.gz" "$base"
-            rm -f "$f"
           done
 
       - name: Upload artifacts
@@ -192,9 +214,14 @@ jobs:
           path: artifacts/
           compression-level: 0
 
+  kotlin-core:
+    name: Kotlin Core Tests
+    uses: ./.github/workflows/core-kotlin-tests.yml
+    secrets: inherit
+
   release:
     name: Publish prerelease (all targets)
-    needs: [build]
+    needs: [build, kotlin-core]
     outputs:
       slug: ${{ steps.slug.outputs.slug }}
       tag: ${{ steps.slug.outputs.tag }}

@@ -18,6 +18,11 @@ use code_cli::login::run_logout;
 mod llm;
 mod usage;
 use llm::{LlmCli, run_llm};
+use code_core::config::{Config, ConfigOverrides};
+use code_core::protocol::{EventMsg, Op, Submission};
+use code_core::{AuthManager, ConversationManager, NewConversation};
+use code_protocol::protocol::SessionSource;
+use code_login::AuthMode;
 use code_common::CliConfigOverrides;
 use code_core::find_conversation_path_by_id_str;
 use code_core::RolloutRecorder;
@@ -139,7 +144,7 @@ enum Subcommand {
     ResponsesApiProxy(ResponsesApiProxyArgs),
 
     /// Diagnose PATH, binary collisions, and versions.
-    Doctor,
+    Doctor(DoctorArgs),
 
     /// Download and run preview artifact by slug.
     Preview(PreviewArgs),
@@ -179,6 +184,13 @@ struct DebugArgs {
     cmd: DebugCommand,
 }
 
+#[derive(Debug, Parser, Default)]
+struct DoctorArgs {
+    /// Additionally run the Kotlin JNI smoke tests (requires repo checkout)
+    #[arg(long = "kotlin-core", default_value_t = false)]
+    run_kotlin_core: bool,
+}
+
 #[derive(Debug, clap::Subcommand)]
 enum DebugCommand {
     /// Run a command under Seatbelt (macOS only).
@@ -186,6 +198,18 @@ enum DebugCommand {
 
     /// Run a command under Landlock+seccomp (Linux only).
     Landlock(LandlockCommand),
+
+    /// Experimental: trigger a Kotlin-hosted turn via the CLI.
+    KotlinTurn(KotlinTurnArgs),
+}
+
+#[derive(Debug, Parser)]
+struct KotlinTurnArgs {
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
+
+    /// Prompt text to echo through the Kotlin engine.
+    prompt: String,
 }
 
 #[derive(Debug, Parser)]
@@ -410,6 +434,13 @@ async fn cli_main(code_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()>
                 )
                 .await?;
             }
+            DebugCommand::KotlinTurn(mut kotlin_cli) => {
+                prepend_config_flags(
+                    &mut kotlin_cli.config_overrides,
+                    root_config_overrides.clone(),
+                );
+                run_kotlin_debug(kotlin_cli).await?;
+            }
         },
         Some(Subcommand::Apply(mut apply_cli)) => {
             prepend_config_flags(
@@ -428,8 +459,8 @@ async fn cli_main(code_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()>
         Some(Subcommand::OrderReplay(args)) => {
             order_replay_main(args)?;
         }
-        Some(Subcommand::Doctor) => {
-            doctor_main().await?;
+        Some(Subcommand::Doctor(args)) => {
+            doctor_main(args).await?;
         }
         Some(Subcommand::Preview(args)) => {
             preview_main(args).await?;
@@ -961,7 +992,7 @@ async fn preview_main(args: PreviewArgs) -> anyhow::Result<()> {
     bail!("No recognized artifact content found.")
 }
 
-async fn doctor_main() -> anyhow::Result<()> {
+async fn doctor_main(args: DoctorArgs) -> anyhow::Result<()> {
     use std::env;
     use std::process::Stdio;
     use tokio::process::Command;
@@ -1081,7 +1112,98 @@ async fn doctor_main() -> anyhow::Result<()> {
     println!("  - Homebrew: brew uninstall code");
     println!("  - Prefer using 'coder' to avoid conflicts with VS Code's 'code'.");
 
+    if args.run_kotlin_core {
+        run_kotlin_core_tests().await?;
+    }
+
     Ok(())
+}
+
+async fn run_kotlin_debug(args: KotlinTurnArgs) -> anyhow::Result<()> {
+    unsafe {
+        std::env::set_var("CODE_ENGINE", "kotlin");
+        // Preserve the legacy flag to keep older helpers working.
+        std::env::set_var("CODE_USE_KOTLIN_ENGINE", "1");
+    }
+    let overrides = args
+        .config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    let config = Config::load_with_cli_overrides(overrides, ConfigOverrides::default())?;
+    let auth_manager = AuthManager::shared_with_mode_and_originator(
+        config.code_home.clone(),
+        AuthMode::ApiKey,
+        config.responses_originator_header.clone(),
+    );
+    let manager = ConversationManager::new(auth_manager, SessionSource::Cli);
+    let NewConversation { conversation, .. } = manager.new_conversation(config).await?;
+    let submission = Submission {
+        id: uuid::Uuid::new_v4().to_string(),
+        op: Op::KotlinTurn {
+            prompt: args.prompt,
+        },
+    };
+    conversation.submit_with_id(submission).await?;
+
+    loop {
+        match conversation.next_event().await {
+            Ok(event) => {
+                println!("{}", serde_json::to_string(&event)?);
+                if matches!(event.msg, EventMsg::AgentMessage(_)) {
+                    break;
+                }
+            }
+            Err(err) => {
+                eprintln!("{err:#}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn locate_repo_script(script_name: &str) -> Option<(PathBuf, PathBuf)> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    for _ in 0..8 {
+        let scripts_dir = dir.join("scripts");
+        let candidate = scripts_dir.join(script_name);
+        if candidate.is_file() {
+            return Some((dir, candidate));
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+async fn run_kotlin_core_tests() -> anyhow::Result<()> {
+    use tokio::process::Command;
+
+    let (repo_root, script_path) = locate_repo_script("run-core-kotlin-tests.sh")
+        .ok_or_else(|| anyhow!(
+            "could not find scripts/run-core-kotlin-tests.sh relative to the CLI binary; run from the repo root"
+        ))?;
+
+    println!("\n[Kotlin] running {}", script_path.display());
+    let status = Command::new(&script_path)
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await?;
+
+    if status.success() {
+        println!("[Kotlin] tests completed successfully");
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Kotlin core tests failed; see log above. Exit status: {}",
+            status
+        ))
+    }
 }
 #[cfg(test)]
 mod tests {

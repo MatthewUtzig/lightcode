@@ -292,6 +292,11 @@ impl ChatWidgetHarness {
             .pending_bottom_spacer_lines_for_test()
     }
 
+    pub fn submit_text_message(&mut self, text: &str) {
+        self.with_chat(|chat| chat.submit_text_message(text.to_string()));
+        self.flush_into_widget();
+    }
+
     pub(crate) fn chat(&mut self) -> &mut ChatWidget<'static> {
         &mut self.chat
     }

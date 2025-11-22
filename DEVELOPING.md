@@ -5,6 +5,16 @@
 - `./build-fast.sh`
 - `pnpm install && pnpm lint`
 
+### Kotlin core + Rust engine invariants
+
+- The Rust engine inside `code-rs/core`, `code_auto_drive_core`, and the upstream mirror under `codex-rs/` stays exactly where it is. Do not delete or move Rust crates while working on Kotlin.
+- Kotlin (`core-kotlin/`) is a sister engine that talks to Rust over JNI. Feature flags should only switch which engine handles a flow; they must not rip out the Rust implementation.
+- Upstream merges from `openai/codex` must continue to apply cleanly, so keep the Rust file layout byte-for-byte compatible with upstream.
+- When adding Kotlin surface area, leave the Rust path intact so parity tests can keep diffing the two implementations.
+- `./build-fast.sh` now runs `scripts/run-core-kotlin-tests.sh` after a successful `code-rs` build unless you set `BUILD_FAST_SKIP_KOTLIN_TESTS=1`.
+- Kotlin now runs by default when you launch the CLI; set `CODE_ENGINE=rust` (or `engine_mode = "rust"` in config) if you need to fall back, and keep `CODE_USE_KOTLIN_ENGINE=1` only for legacy tooling.
+- The Kotlin build copies a shaded engine jar to `code-rs/target/kotlin/code-kotlin-engine.jar`. The CLI now auto-discovers the jar when `CODE_KOTLIN_CLASSPATH` is unset by probing for a sibling next to the binary, then falling back to the `target/kotlin` copy.
+
 ### Build cache layout and sccache
 
 The fast build now chooses a cache bucket per Git worktree or branch so

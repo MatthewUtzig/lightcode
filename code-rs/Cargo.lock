@@ -1136,6 +1136,7 @@ dependencies = [
  "code-apply-patch",
  "code-browser",
  "code-file-search",
+ "code-kotlin-host",
  "code-mcp-client",
  "code-mcp-types",
  "code-otel",
@@ -1198,6 +1199,22 @@ dependencies = [
  "windows-sys 0.61.2",
  "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "code-core-jni"
+version = "0.0.0"
+dependencies = [
+ "code-app-server-protocol",
+ "code-auto-drive-core",
+ "code-core",
+ "futures",
+ "jni",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1275,6 +1292,30 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "walkdir",
+]
+
+[[package]]
+name = "code-kotlin-host"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "jni",
+ "once_cell",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "code-kotlin-parity-tests"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "code-auto-drive-core",
+ "code-core-jni",
+ "code-kotlin-host",
+ "serde",
+ "serde_json",
+ "serial_test",
 ]
 
 [[package]]
@@ -3416,6 +3457,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
+name = "java-locator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09c46c1fe465c59b1474e665e85e1256c3893dd00927b8d55f63b09044c1e64f"
+dependencies = [
+ "glob",
+]
+
+[[package]]
 name = "jiff"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3448,7 +3498,9 @@ dependencies = [
  "cesu8",
  "cfg-if",
  "combine",
+ "java-locator",
  "jni-sys",
+ "libloading",
  "log",
  "thiserror 1.0.69",
  "walkdir",
@@ -3549,6 +3601,16 @@ checksum = "5037190e1f70cbeef565bd267599242926f724d3b8a9f510fd7e0b540cfa4404"
 dependencies = [
  "arbitrary",
  "cc",
+]
+
+[[package]]
+name = "libloading"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
+dependencies = [
+ "cfg-if",
+ "winapi",
 ]
 
 [[package]]

@@ -27,6 +27,7 @@ code-rmcp-client = { workspace = true }
 code-app-server-protocol = { workspace = true }
 code-otel = { workspace = true, features = ["otel"] }
 code-browser = { path = "../browser" }
+code-kotlin-host = { path = "../code-kotlin-host" }
 code-version = { path = "../code-version" }
 agent-client-protocol = "0.4.3"
 dirs = { workspace = true }

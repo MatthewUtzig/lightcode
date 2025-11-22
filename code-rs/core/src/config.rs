@@ -59,6 +59,7 @@ use serde::de::{self, Unexpected};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -81,6 +82,46 @@ pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5.1-codex";
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineMode {
+    Rust,
+    Kotlin,
+}
+
+impl EngineMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EngineMode::Rust => "rust",
+            EngineMode::Kotlin => "kotlin",
+        }
+    }
+}
+
+impl fmt::Display for EngineMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Default for EngineMode {
+    fn default() -> Self {
+        EngineMode::Kotlin
+    }
+}
+
+impl FromStr for EngineMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rust" => Ok(EngineMode::Rust),
+            "kotlin" | "default" => Ok(EngineMode::Kotlin),
+            other => Err(format!("unknown engine mode `{other}`")),
+        }
+    }
+}
 
 const AI_KEY_DEFAULT_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 const AI_KEY_LONG_LIFETIME: Duration = Duration::from_secs(72 * 60 * 60);
@@ -251,6 +292,9 @@ pub struct Config {
 
     /// Optional override for Auto Drive runs. Falls back to `model` when unset.
     pub auto_model: Option<String>,
+
+    /// Active engine implementation for new sessions.
+    pub engine_mode: EngineMode,
 
     /// Reasoning effort used when running review sessions.
     pub review_model_reasoning_effort: ReasoningEffort,
@@ -1246,6 +1290,27 @@ pub fn set_auto_drive_settings(
     Ok(())
 }
 
+/// Persist the default engine mode at the top level of config.toml.
+pub fn set_engine_mode(code_home: &Path, mode: EngineMode) -> anyhow::Result<()> {
+    let config_path = code_home.join(CONFIG_TOML_FILE);
+    let read_path = resolve_code_path_for_read(code_home, Path::new(CONFIG_TOML_FILE));
+
+    let mut doc = match std::fs::read_to_string(&read_path) {
+        Ok(contents) => contents.parse::<DocumentMut>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    doc["engine_mode"] = toml_edit::value(mode.as_str());
+
+    std::fs::create_dir_all(code_home)?;
+    let tmp_file = NamedTempFile::new_in(code_home)?;
+    std::fs::write(tmp_file.path(), doc.to_string())?;
+    tmp_file.persist(config_path)?;
+
+    Ok(())
+}
+
 /// Persist the AI key settings under `[ai_key]`.
 pub fn set_ai_key_settings(code_home: &Path, settings: &AiKeySettings) -> anyhow::Result<()> {
     let config_path = code_home.join(CONFIG_TOML_FILE);
@@ -1882,6 +1947,8 @@ pub struct ConfigToml {
     pub review_model: Option<String>,
     /// Auto Drive model override used by the `/auto` feature.
     pub auto_model: Option<String>,
+    /// Selects the runtime engine for Codex.
+    pub engine_mode: Option<EngineMode>,
     /// Reasoning effort override used for the review model.
     pub review_model_reasoning_effort: Option<ReasoningEffort>,
 
@@ -2244,6 +2311,7 @@ pub struct ConfigOverrides {
     pub model: Option<String>,
     pub review_model: Option<String>,
     pub auto_model: Option<String>,
+    pub engine_mode: Option<EngineMode>,
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<AskForApproval>,
     pub sandbox_mode: Option<SandboxMode>,
@@ -2295,6 +2363,7 @@ impl Config {
             model,
             review_model: override_review_model,
             auto_model: override_auto_model,
+            engine_mode: override_engine_mode,
             cwd,
             approval_policy,
             sandbox_mode,
@@ -2340,6 +2409,16 @@ impl Config {
                 }
                 None => (None, ConfigProfile::default()),
             };
+
+        let mut engine_mode = cfg.engine_mode.unwrap_or_default();
+        if let Some(mode) = override_engine_mode {
+            engine_mode = mode;
+        }
+        if let Some(env_mode) = engine_mode_from_env() {
+            engine_mode = env_mode;
+        } else if legacy_kotlin_engine_env_enabled() {
+            engine_mode = EngineMode::Kotlin;
+        }
 
         // (removed placeholder) sandbox_policy computed below after resolving project overrides.
 
@@ -2623,6 +2702,7 @@ impl Config {
             model,
             review_model,
             auto_model,
+            engine_mode,
             review_model_reasoning_effort,
             model_family,
             model_context_window,
@@ -2897,6 +2977,28 @@ fn env_overrides_present() -> bool {
         || matches!(std::env::var("CODEX_HOME"), Ok(ref v) if !v.trim().is_empty())
 }
 
+fn engine_mode_from_env() -> Option<EngineMode> {
+    match std::env::var("CODE_ENGINE") {
+        Ok(value) => {
+            if value.trim().is_empty() {
+                return None;
+            }
+            match EngineMode::from_str(&value) {
+                Ok(mode) => Some(mode),
+                Err(err) => {
+                    tracing::warn!("Ignoring invalid CODE_ENGINE value `{}`: {}", value, err);
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn legacy_kotlin_engine_env_enabled() -> bool {
+    matches!(std::env::var("CODE_USE_KOTLIN_ENGINE"), Ok(ref v) if v == "1")
+}
+
 fn default_code_home_dir() -> Option<PathBuf> {
     let mut path = home_dir()?;
     path.push(".code");
@@ -3092,6 +3194,37 @@ persistence = "none"
         let parsed_bool = toml::from_str::<ConfigToml>(cfg_bool)
             .expect("boolean should deserialize");
         assert_eq!(parsed_bool.auto_upgrade_enabled, Some(true));
+    }
+
+    #[test]
+    fn config_defaults_to_kotlin_engine_mode() -> anyhow::Result<()> {
+        let code_home = TempDir::new()?;
+        let cfg = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            code_home.path().to_path_buf(),
+        )?;
+        assert!(matches!(cfg.engine_mode, EngineMode::Kotlin));
+        Ok(())
+    }
+
+    #[test]
+    fn code_engine_env_parses_case_insensitively() {
+        let _guard = EnvVarGuard::new("CODE_ENGINE");
+        unsafe {
+            std::env::set_var("CODE_ENGINE", "KoTlIn");
+        }
+        assert_eq!(engine_mode_from_env(), Some(EngineMode::Kotlin));
+
+        unsafe {
+            std::env::set_var("CODE_ENGINE", "rUsT");
+        }
+        assert_eq!(engine_mode_from_env(), Some(EngineMode::Rust));
+
+        unsafe {
+            std::env::set_var("CODE_ENGINE", "bogus");
+        }
+        assert_eq!(engine_mode_from_env(), None);
     }
 
     #[test]

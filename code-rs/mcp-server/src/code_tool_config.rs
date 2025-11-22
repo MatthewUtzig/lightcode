@@ -255,6 +255,7 @@ impl CodexToolCallParam {
             model,
             review_model: None,
             auto_model: None,
+            engine_mode: None,
             config_profile: profile,
             cwd: cwd.map(PathBuf::from),
             approval_policy: approval_policy.map(Into::into),

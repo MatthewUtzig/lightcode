@@ -1445,6 +1445,9 @@ pub struct SessionConfiguredEvent {
     /// Tell the client what model is being queried.
     pub model: String,
 
+    /// Effective engine powering this session (e.g., "kotlin" or "rust").
+    pub engine_mode: String,
+
     /// The effort the model is putting into reasoning about the user's request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
@@ -1575,6 +1578,7 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: conversation_id,
                 model: "codex-mini-latest".to_string(),
+                engine_mode: "kotlin".to_string(),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
                 history_log_id: 0,
                 history_entry_count: 0,
@@ -1591,6 +1595,7 @@ mod tests {
                 "type": "session_configured",
                 "session_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                 "model": "codex-mini-latest",
+                "engine_mode": "kotlin",
                 "reasoning_effort": "medium",
                 "history_log_id": 0,
                 "history_entry_count": 0,

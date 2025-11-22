@@ -37,6 +37,86 @@ pub struct ConversationManager {
     session_source: SessionSource,
 }
 
+pub struct ConversationPruneOutcome {
+    pub retained_history: Vec<ResponseItem>,
+    pub pruned_user_turns: usize,
+    pub was_reset: bool,
+}
+
+pub struct ConversationForkOutcome {
+    pub retained_history: Vec<ResponseItem>,
+    pub dropped_user_turns: usize,
+    pub became_new: bool,
+}
+
+pub fn fork_history_from_response_items(
+    history: Vec<ResponseItem>,
+    drop_last_user_turns: usize,
+) -> ConversationForkOutcome {
+    let initial_history = InitialHistory::Forked(
+        history
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect(),
+    );
+
+    let truncated = truncate_after_dropping_last_messages(initial_history, drop_last_user_turns);
+    let retained_rollouts = truncated.get_rollout_items();
+    let retained_history: Vec<ResponseItem> = retained_rollouts
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(response) => Some(response),
+            _ => None,
+        })
+        .collect();
+
+    let original_user_turns = count_user_messages(&history);
+    let retained_user_turns = count_user_messages(&retained_history);
+    let dropped_user_turns = original_user_turns.saturating_sub(retained_user_turns);
+    let became_new = matches!(truncated, InitialHistory::New);
+
+    ConversationForkOutcome {
+        retained_history,
+        dropped_user_turns,
+        became_new,
+    }
+}
+
+pub fn prune_history_after_dropping_last_user_turns(
+    history: Vec<ResponseItem>,
+    drop_last_user_turns: usize,
+) -> ConversationPruneOutcome {
+    let initial_history = InitialHistory::Forked(
+        history
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect(),
+    );
+
+    let truncated = truncate_after_dropping_last_messages(initial_history, drop_last_user_turns);
+    let retained_rollouts = truncated.get_rollout_items();
+    let retained_history: Vec<ResponseItem> = retained_rollouts
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(response) => Some(response),
+            _ => None,
+        })
+        .collect();
+
+    let total_user_turns = count_user_messages(&history);
+    let retained_user_turns = count_user_messages(&retained_history);
+    let pruned_user_turns = total_user_turns.saturating_sub(retained_user_turns);
+    let was_reset = matches!(truncated, InitialHistory::New);
+
+    ConversationPruneOutcome {
+        retained_history,
+        pruned_user_turns,
+        was_reset,
+    }
+}
+
 impl ConversationManager {
     pub fn new(auth_manager: Arc<AuthManager>, session_source: SessionSource) -> Self {
         Self {
@@ -239,6 +319,13 @@ fn truncate_after_dropping_last_messages(history: InitialHistory, n: usize) -> I
     } else {
         InitialHistory::Forked(rolled)
     }
+}
+
+fn count_user_messages(items: &[ResponseItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
+        .count()
 }
 
 #[cfg(test)]

@@ -128,6 +128,14 @@ pub mod test_helpers {
 
     use std::io::Write;
 
+    /// Helper to set environment variables in tests without requiring an
+    /// unsafe block at every callsite.
+    pub fn set_test_env_var(key: &str, value: &str) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
     /// Render successive frames of the chat widget into a VT100-backed terminal.
     /// Each entry in `frames` specifies the `(width, height)` for that capture.
     /// Returns a vector of screen dumps, one per frame.
@@ -364,6 +372,7 @@ pub async fn run_main(
         model,
         review_model: None,
         auto_model: None,
+        engine_mode: None,
         approval_policy,
         sandbox_mode,
         cwd,

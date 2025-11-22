@@ -72,6 +72,11 @@ pub enum ValidationGroup {
 #[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Op {
+    /// Experimental: run a Kotlin-hosted turn.
+    KotlinTurn {
+        prompt: String,
+    },
+
     /// Configure the model session.
     ConfigureSession {
         /// Provider identifier ("openai", "openrouter", ...).
@@ -1265,6 +1270,9 @@ pub struct SessionConfiguredEvent {
     /// Tell the client what model is being queried.
     pub model: String,
 
+    /// Effective engine powering this session (e.g., "kotlin" or "rust").
+    pub engine_mode: String,
+
     /// Identifier of the history log file (inode on Unix, 0 otherwise).
     pub history_log_id: u64,
 
@@ -1420,6 +1428,7 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id,
                 model: "codex-mini-latest".to_string(),
+                engine_mode: "kotlin".to_string(),
                 history_log_id: 0,
                 history_entry_count: 0,
             }),
@@ -1428,7 +1437,7 @@ mod tests {
         let serialized = serde_json::to_string(&event).unwrap();
         assert_eq!(
             serialized,
-            r#"{"id":"1234","event_seq":0,"msg":{"type":"session_configured","session_id":"67e55044-10b1-426f-9247-bb680e5fe0c8","model":"codex-mini-latest","history_log_id":0,"history_entry_count":0}}"#
+            r#"{"id":"1234","event_seq":0,"msg":{"type":"session_configured","session_id":"67e55044-10b1-426f-9247-bb680e5fe0c8","model":"codex-mini-latest","engine_mode":"kotlin","history_log_id":0,"history_entry_count":0}}"#
         );
     }
 }
